@@ -1,0 +1,8 @@
+streamlit
+st-cytoscape
+pandas
+networkx
+google-cloud-bigquery
+google-auth
+google-auth-oauthlib
+python-dotenv
