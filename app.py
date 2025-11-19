@@ -42,7 +42,7 @@ if "layout_seed" not in st.session_state:
 if "ultimo_cnpj" not in st.session_state:
     st.session_state["ultimo_cnpj"] = None
 
-# novo: onde guardamos tudo que precisa pra renderizar o grafo/tabelas
+# guarda tudo que precisa pra renderizar o grafo/tabelas
 if "grafo_data" not in st.session_state:
     st.session_state["grafo_data"] = None
 
@@ -79,7 +79,6 @@ def get_bq_client():
     1) Streamlit Cloud: guardar o JSON da service account em st.secrets["gcp_service_account"]
     2) Local: usar gcloud auth application-default login ou GOOGLE_APPLICATION_CREDENTIALS
     """
-    # 1) Service Account via secrets (ideal pra Cloud)
     if "gcp_service_account" in st.secrets:
         creds = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
@@ -88,7 +87,6 @@ def get_bq_client():
         client = bigquery.Client(project=project_id, credentials=creds)
         return client
 
-    # 2) Tenta ADC (local)
     client = bigquery.Client()
     return client
 
@@ -272,7 +270,6 @@ def selecionar_qsa_atual(df_socios_foco: pd.DataFrame) -> pd.DataFrame:
     data_max = df["data"].max()
     df_qsa = df[df["data"] == data_max].copy()
 
-    # remove duplicados por nome, se houver
     df_qsa = df_qsa.sort_values("data_entrada_sociedade", ascending=False)
     df_qsa = df_qsa.drop_duplicates(subset=["nome"]).reset_index(drop=True)
 
@@ -376,7 +373,6 @@ def construir_grafo(
     """
     G = nx.Graph()
 
-    # nó foco
     if df_empresa_foco.empty:
         raise ValueError("Empresa foco não encontrada no CNPJ básico informado.")
 
@@ -392,7 +388,7 @@ def construir_grafo(
         eh_empresa_foco=True,
     )
 
-    # sócios do QSA atual (nível 2)
+    # sócios do QSA atual
     socios_qsa = df_socios_qsa.copy()
     socios_qsa = socios_qsa.dropna(subset=["nome"])
     socios_qsa = socios_qsa.drop_duplicates(subset=["nome"]).reset_index(drop=True)
@@ -415,7 +411,6 @@ def construir_grafo(
             cnpj_basico=None,
             eh_empresa_foco=False,
         )
-        # aresta sócio -> foco
         G.add_edge(
             node_id,
             foco_id,
@@ -426,9 +421,8 @@ def construir_grafo(
 
         map_nome_to_node[nome] = node_id
 
-    # empresas vinculadas (nível 3)
+    # empresas vinculadas
     if not df_empresas_vinc.empty:
-        # info de cada empresa única
         emp_unique = (
             df_empresas_vinc.dropna(subset=["cnpj_basico"])
             .drop_duplicates(subset=["cnpj_basico"])
@@ -449,7 +443,6 @@ def construir_grafo(
                 eh_empresa_foco=False,
             )
 
-        # arestas sócio -> empresa
         for _, r in df_empresas_vinc.iterrows():
             nome_socio = r["nome_socio"]
             socio_id = map_nome_to_node.get(nome_socio)
@@ -469,11 +462,10 @@ def construir_grafo(
                 data_entrada=str(r.get("data_entrada_sociedade", "")),
             )
 
-    # degree
     degree_dict = dict(G.degree())
     nx.set_node_attributes(G, degree_dict, "degree")
 
-    # convenience: marca label_visible pra foco + sócios
+    # label fixo pra foco + sócios
     for n, data in G.nodes(data=True):
         nivel = data.get("nivel")
         label_vis = (n == foco_id) or (nivel == "socio")
@@ -484,12 +476,12 @@ def construir_grafo(
 
 
 # ============================================================
-# LAYOUT E ELEMENTOS CYTOSCAPE
+# LAYOUT E ELEMENTOS CYTOSCAPE (spring + anel flexível)
 # ============================================================
 
 SCALE = 700.0
-R_MIN_SOCIOS = 650.0
-R_MAX_SOCIOS = 1100.0
+R_MIN_SOCIOS = 300.0   # igual à célula do notebook
+R_MAX_SOCIOS = 1000.0  # igual à célula do notebook
 
 
 def compute_positions(G: nx.Graph, foco_id: str = "FOCO", seed: int = 42, k: float = 2.0):
@@ -497,24 +489,22 @@ def compute_positions(G: nx.Graph, foco_id: str = "FOCO", seed: int = 42, k: flo
     pos = nx.spring_layout(
         G,
         k=k,
-        iterations=400,
+        iterations=4000,   # mais iterações, mais "relaxado"
         seed=seed,
         weight=None,
     )
 
-    # recentra no foco
     cx, cy = pos[foco_id]
     for n in pos:
         x, y = pos[n]
         pos[n] = ((x - cx) * SCALE, (y - cy) * SCALE)
 
     socios_ids = [n for n, d in G.nodes(data=True) if d.get("nivel") == "socio"]
-    R_inner = 0.8 * R_MIN_SOCIOS  # empresas ficam dentro disso
+    R_inner = 0.8 * R_MIN_SOCIOS
 
-    # foco no centro
     pos[foco_id] = (0.0, 0.0)
 
-    # empresas vinculadas ficam dentro do círculo interno
+    # empresas dentro do círculo interno
     for n, data in G.nodes(data=True):
         if n == foco_id:
             continue
@@ -525,7 +515,7 @@ def compute_positions(G: nx.Graph, foco_id: str = "FOCO", seed: int = 42, k: flo
                 fator = R_inner / r
                 pos[n] = (x * fator, y * fator)
 
-    # sócios: respeita ângulo, mas clampa raio entre min e max
+    # sócios com raio entre min e max, mantendo ângulo
     for sid in socios_ids:
         x, y = pos[sid]
         r = math.hypot(x, y)
@@ -573,6 +563,7 @@ def build_cytoscape_elements(G: nx.Graph, pos, selected_ids):
                 "eh_empresa_foco": str(bool(data.get("eh_empresa_foco", False))).lower(),
                 "degree": int(data.get("degree", 0)),
                 "highlight": highlight,
+                "label_visible": data.get("label_visible", "false"),
             },
             "position": {"x": float(x), "y": float(y)},
         }
@@ -639,7 +630,7 @@ def get_stylesheet():
                 "border-width": 3,
             },
         },
-        # labels fixos
+        # labels fixos pra foco + sócios
         {
             "selector": "node[label_visible = 'true']",
             "style": {
@@ -650,14 +641,14 @@ def get_stylesheet():
                 "color": "#000000",
             },
         },
-        # dim
+        # nós apagados
         {
             "selector": "node[highlight = 'dim']",
             "style": {
                 "opacity": 0.15,
             },
         },
-        # nó selecionado
+        # nó selecionado (self)
         {
             "selector": "node[highlight = 'self']",
             "style": {
@@ -668,7 +659,7 @@ def get_stylesheet():
                 "font-size": "11px",
             },
         },
-        # vizinho
+        # vizinhos
         {
             "selector": "node[highlight = 'neighbor']",
             "style": {
@@ -677,6 +668,13 @@ def get_stylesheet():
                 "border-color": "#333333",
                 "label": "data(label)",
                 "font-size": "10px",
+            },
+        },
+        # neutralizar overlay vermelho default do selected
+        {
+            "selector": "node:selected",
+            "style": {
+                "overlay-opacity": 0,
             },
         },
         # arestas base
@@ -689,14 +687,14 @@ def get_stylesheet():
                 "opacity": 0.6,
             },
         },
-        # arestas dim
+        # arestas apagadas
         {
             "selector": "edge[highlight = 'dim']",
             "style": {
                 "opacity": 0.1,
             },
         },
-        # arestas conectadas
+        # arestas ligadas
         {
             "selector": "edge[highlight = 'connected']",
             "style": {
@@ -776,7 +774,6 @@ if run_btn:
         set_progress(75, "Construindo grafo...")
         G = construir_grafo(df_empresa_foco, df_socios_qsa, df_empresas_vinc, cnpj_basico)
 
-        # guarda tudo na sessão
         st.session_state["grafo_data"] = {
             "cnpj_basico": cnpj_basico,
             "df_empresa_foco": df_empresa_foco,
@@ -784,7 +781,7 @@ if run_btn:
             "df_empresas_vinc": df_empresas_vinc,
             "G": G,
         }
-        st.session_state["selected_nodes"] = []  # limpa seleção ao trocar CNPJ
+        st.session_state["selected_nodes"] = []
 
         set_progress(100, "Pronto! Grafo gerado com sucesso.")
         time.sleep(0.5)
@@ -807,10 +804,10 @@ if grafo_data is not None:
     df_empresas_vinc = grafo_data["df_empresas_vinc"]
     G = grafo_data["G"]
 
-    # layout + elementos
     seed = st.session_state["layout_seed"]
     pos = compute_positions(G, foco_id="FOCO", seed=seed, k=2.0)
 
+    # seleção atual
     selected_ids = st.session_state["selected_nodes"]
     elements = build_cytoscape_elements(G, pos, selected_ids)
     stylesheet = get_stylesheet()
@@ -820,12 +817,12 @@ if grafo_data is not None:
     with col_b1:
         if st.button("🔁 Recalcular layout (shake)", use_container_width=True):
             st.session_state["layout_seed"] = int(time.time()) % 100000
-            st.experimental_rerun()
+            st.rerun()
 
     with col_b2:
         if st.button("🧹 Limpar seleção", use_container_width=True):
             st.session_state["selected_nodes"] = []
-            st.experimental_rerun()
+            st.rerun()
 
     # Grafo
     selection = cytoscape(
@@ -839,12 +836,17 @@ if grafo_data is not None:
     )
 
     new_selected_ids = selection.get("nodes", [])
-    st.session_state["selected_nodes"] = new_selected_ids
 
-    # Tabelas dinâmicas
+    # se a seleção mudou, atualiza estado e reroda para aplicar highlight já na próxima renderização
+    if new_selected_ids != selected_ids:
+        st.session_state["selected_nodes"] = new_selected_ids
+        st.rerun()
+
+    # a partir daqui, seleção está estável para esta execução
+    selected_ids = st.session_state["selected_nodes"]
+
     st.markdown("### 📊 Detalhes dos nós selecionados")
 
-    selected_ids = st.session_state["selected_nodes"]
     if not selected_ids:
         st.info("Selecione um ou mais nós no grafo para ver detalhes aqui embaixo.")
     else:
