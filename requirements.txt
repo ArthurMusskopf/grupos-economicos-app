@@ -6,3 +6,4 @@ google-cloud-bigquery
 google-auth
 google-auth-oauthlib
 python-dotenv
+db-dtypes
