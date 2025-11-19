@@ -42,21 +42,28 @@ if "layout_seed" not in st.session_state:
 if "ultimo_cnpj" not in st.session_state:
     st.session_state["ultimo_cnpj"] = None
 
+# novo: onde guardamos tudo que precisa pra renderizar o grafo/tabelas
+if "grafo_data" not in st.session_state:
+    st.session_state["grafo_data"] = None
+
+
 # ------------------------------------------------------------
 # Logger simples (na sidebar)
 # ------------------------------------------------------------
 log_placeholder = st.sidebar.empty()
 
+
 def render_logs():
     log_placeholder.text("\n".join(st.session_state["logs"][-40:]))
+
 
 def log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     st.session_state["logs"].append(f"[{ts}] {msg}")
     render_logs()
 
-render_logs()
 
+render_logs()
 st.sidebar.markdown("### ⚙️ Log de execução")
 
 
@@ -96,6 +103,7 @@ def normalizar_cnpj(cnpj_str: str) -> str:
     if len(digitos) != 14:
         raise ValueError("CNPJ deve ter 14 dígitos após remover separadores.")
     return digitos
+
 
 def extrair_cnpj_basico(cnpj_14: str) -> str:
     """Primeiros 8 dígitos do CNPJ."""
@@ -483,6 +491,7 @@ SCALE = 700.0
 R_MIN_SOCIOS = 650.0
 R_MAX_SOCIOS = 1100.0
 
+
 def compute_positions(G: nx.Graph, foco_id: str = "FOCO", seed: int = 42, k: float = 2.0):
     log(f"Calculando layout (spring) com seed={seed}, k={k}...")
     pos = nx.spring_layout(
@@ -731,7 +740,7 @@ def set_progress(pct: int, msg: str):
 
 
 # ------------------------------------------------------------
-# EXECUÇÃO
+# EXECUÇÃO (ETL + GRAFO) – só quando clicar no botão
 # ------------------------------------------------------------
 if run_btn:
     try:
@@ -767,151 +776,162 @@ if run_btn:
         set_progress(75, "Construindo grafo...")
         G = construir_grafo(df_empresa_foco, df_socios_qsa, df_empresas_vinc, cnpj_basico)
 
+        # guarda tudo na sessão
+        st.session_state["grafo_data"] = {
+            "cnpj_basico": cnpj_basico,
+            "df_empresa_foco": df_empresa_foco,
+            "df_socios_qsa": df_socios_qsa,
+            "df_empresas_vinc": df_empresas_vinc,
+            "G": G,
+        }
         st.session_state["selected_nodes"] = []  # limpa seleção ao trocar CNPJ
-
-        # ----------------------------------------------------
-        # VISUALIZAÇÃO DO GRAFO
-        # ----------------------------------------------------
-        set_progress(90, "Calculando layout e renderizando grafo...")
-
-        seed = st.session_state["layout_seed"]
-        pos = compute_positions(G, foco_id="FOCO", seed=seed, k=2.0)
-
-        selected_ids = st.session_state["selected_nodes"]
-        elements = build_cytoscape_elements(G, pos, selected_ids)
-        stylesheet = get_stylesheet()
-
-        # Botões de layout e limpeza
-        col_b1, col_b2 = st.columns([1, 1])
-        with col_b1:
-            if st.button("🔁 Recalcular layout (shake)", use_container_width=True):
-                st.session_state["layout_seed"] = int(time.time()) % 100000
-                st.experimental_rerun()
-
-        with col_b2:
-            if st.button("🧹 Limpar seleção", use_container_width=True):
-                st.session_state["selected_nodes"] = []
-                st.experimental_rerun()
-
-        # Grafo
-        selection = cytoscape(
-            elements=elements,
-            stylesheet=stylesheet,
-            layout={"name": "preset", "fit": True, "padding": 140},
-            width="100%",
-            height="900px",
-            selection_type="additive",
-            key="grafo-cnpj",
-        )
-
-        new_selected_ids = selection.get("nodes", [])
-
-        # se seleção mudou, atualiza state e reroda pra atualizar highlight
-        if set(new_selected_ids) != set(st.session_state["selected_nodes"]):
-            st.session_state["selected_nodes"] = new_selected_ids
-            st.experimental_rerun()
 
         set_progress(100, "Pronto! Grafo gerado com sucesso.")
         time.sleep(0.5)
         progress.empty()
-
-        # ----------------------------------------------------
-        # TABELAS DINÂMICAS ABAIXO DO GRAFO
-        # ----------------------------------------------------
-        st.markdown("### 📊 Detalhes dos nós selecionados")
-
-        selected_ids = st.session_state["selected_nodes"]
-        if not selected_ids:
-            st.info("Selecione um ou mais nós no grafo para ver detalhes aqui embaixo.")
-        else:
-            st.write(f"Nós selecionados: {selected_ids}")
-
-            for node_id in selected_ids:
-                attrs = G.nodes[node_id]
-                tipo_no = attrs.get("tipo")
-                nivel = attrs.get("nivel")
-                nome = attrs.get("nome")
-                cnpj_b = attrs.get("cnpj_basico")
-
-                st.markdown(f"#### Nó `{node_id}` – {attrs.get('label', '')}")
-                info = {
-                    "id_no": node_id,
-                    "nivel": nivel,
-                    "tipo_no": tipo_no,
-                    "nome": nome,
-                    "cnpj_basico": cnpj_b,
-                    "eh_empresa_foco": attrs.get("eh_empresa_foco"),
-                }
-                st.dataframe(pd.DataFrame([info]))
-
-                # foco
-                if nivel == "foco":
-                    st.markdown("**Empresa foco**")
-                    st.dataframe(df_empresa_foco)
-
-                    # QSA atual
-                    if not df_socios_qsa.empty:
-                        st.markdown("**QSA atual da empresa foco**")
-                        cols = [
-                            "ano",
-                            "mes",
-                            "data",
-                            "tipo",
-                            "nome",
-                            "documento",
-                            "qualificacao",
-                            "data_entrada_sociedade",
-                            "faixa_etaria",
-                        ]
-                        cols = [c for c in cols if c in df_socios_qsa.columns]
-                        st.dataframe(df_socios_qsa[cols].sort_values("nome"))
-
-                # sócio
-                elif nivel == "socio" and nome is not None:
-                    df_socio_foco = (
-                        df_socios_qsa[df_socios_qsa["nome"] == nome]
-                        .sort_values("data_entrada_sociedade", ascending=False)
-                    )
-                    if not df_socio_foco.empty:
-                        st.markdown("**Registro do sócio no QSA da empresa foco (mais recente primeiro)**")
-                        st.dataframe(df_socio_foco)
-
-                    df_emp_socio = (
-                        df_empresas_vinc[df_empresas_vinc["nome_socio"] == nome]
-                        .sort_values(["data", "razao_social"], ascending=[False, True])
-                    )
-                    if not df_emp_socio.empty:
-                        st.markdown("**Empresas em que este sócio aparece no QSA**")
-                        st.dataframe(df_emp_socio)
-
-                # empresa vinculada
-                elif nivel == "empresa_vinc" and cnpj_b is not None:
-                    df_emp = df_empresas_vinc[
-                        df_empresas_vinc["cnpj_basico"].astype(str) == str(cnpj_b)
-                    ].copy()
-
-                    if not df_emp.empty:
-                        df_emp_info = (
-                            df_emp.drop_duplicates(subset=["cnpj_basico"])[
-                                [
-                                    "cnpj_basico",
-                                    "razao_social",
-                                    "natureza_juridica_descricao",
-                                    "capital_social",
-                                ]
-                            ]
-                        )
-                        st.markdown("**Empresa vinculada**")
-                        st.dataframe(df_emp_info)
-
-                        df_qsa_emp = df_emp[
-                            ["nome_socio", "documento", "qualificacao", "data_entrada_sociedade"]
-                        ].sort_values("nome_socio")
-                        st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
-                        st.dataframe(df_qsa_emp)
 
     except Exception as e:
         st.error(f"Erro durante a execução: {e}")
         log(f"ERRO: {e}")
         progress.empty()
 
+# ------------------------------------------------------------
+# VISUALIZAÇÃO DO GRAFO + TABELAS (usa o que está em session_state)
+# ------------------------------------------------------------
+grafo_data = st.session_state.get("grafo_data")
+
+if grafo_data is not None:
+    cnpj_basico = grafo_data["cnpj_basico"]
+    df_empresa_foco = grafo_data["df_empresa_foco"]
+    df_socios_qsa = grafo_data["df_socios_qsa"]
+    df_empresas_vinc = grafo_data["df_empresas_vinc"]
+    G = grafo_data["G"]
+
+    # layout + elementos
+    seed = st.session_state["layout_seed"]
+    pos = compute_positions(G, foco_id="FOCO", seed=seed, k=2.0)
+
+    selected_ids = st.session_state["selected_nodes"]
+    elements = build_cytoscape_elements(G, pos, selected_ids)
+    stylesheet = get_stylesheet()
+
+    # Botões layout / limpar seleção
+    col_b1, col_b2 = st.columns([1, 1])
+    with col_b1:
+        if st.button("🔁 Recalcular layout (shake)", use_container_width=True):
+            st.session_state["layout_seed"] = int(time.time()) % 100000
+            st.experimental_rerun()
+
+    with col_b2:
+        if st.button("🧹 Limpar seleção", use_container_width=True):
+            st.session_state["selected_nodes"] = []
+            st.experimental_rerun()
+
+    # Grafo
+    selection = cytoscape(
+        elements=elements,
+        stylesheet=stylesheet,
+        layout={"name": "preset", "fit": True, "padding": 140},
+        width="100%",
+        height="900px",
+        selection_type="additive",
+        key="grafo-cnpj",
+    )
+
+    new_selected_ids = selection.get("nodes", [])
+    st.session_state["selected_nodes"] = new_selected_ids
+
+    # Tabelas dinâmicas
+    st.markdown("### 📊 Detalhes dos nós selecionados")
+
+    selected_ids = st.session_state["selected_nodes"]
+    if not selected_ids:
+        st.info("Selecione um ou mais nós no grafo para ver detalhes aqui embaixo.")
+    else:
+        st.write(f"Nós selecionados: {selected_ids}")
+
+        for node_id in selected_ids:
+            attrs = G.nodes[node_id]
+            tipo_no = attrs.get("tipo")
+            nivel = attrs.get("nivel")
+            nome = attrs.get("nome")
+            cnpj_b = attrs.get("cnpj_basico")
+
+            st.markdown(f"#### Nó `{node_id}` – {attrs.get('label', '')}")
+            info = {
+                "id_no": node_id,
+                "nivel": nivel,
+                "tipo_no": tipo_no,
+                "nome": nome,
+                "cnpj_basico": cnpj_b,
+                "eh_empresa_foco": attrs.get("eh_empresa_foco"),
+            }
+            st.dataframe(pd.DataFrame([info]))
+
+            # foco
+            if nivel == "foco":
+                st.markdown("**Empresa foco**")
+                st.dataframe(df_empresa_foco)
+
+                if not df_socios_qsa.empty:
+                    st.markdown("**QSA atual da empresa foco**")
+                    cols = [
+                        "ano",
+                        "mes",
+                        "data",
+                        "tipo",
+                        "nome",
+                        "documento",
+                        "qualificacao",
+                        "data_entrada_sociedade",
+                        "faixa_etaria",
+                    ]
+                    cols = [c for c in cols if c in df_socios_qsa.columns]
+                    st.dataframe(df_socios_qsa[cols].sort_values("nome"))
+
+            # sócio
+            elif nivel == "socio" and nome is not None:
+                df_socio_foco = (
+                    df_socios_qsa[df_socios_qsa["nome"] == nome]
+                    .sort_values("data_entrada_sociedade", ascending=False)
+                )
+                if not df_socio_foco.empty:
+                    st.markdown(
+                        "**Registro do sócio no QSA da empresa foco "
+                        "(mais recente primeiro)**"
+                    )
+                    st.dataframe(df_socio_foco)
+
+                df_emp_socio = (
+                    df_empresas_vinc[df_empresas_vinc["nome_socio"] == nome]
+                    .sort_values(["data", "razao_social"], ascending=[False, True])
+                )
+                if not df_emp_socio.empty:
+                    st.markdown("**Empresas em que este sócio aparece no QSA**")
+                    st.dataframe(df_emp_socio)
+
+            # empresa vinculada
+            elif nivel == "empresa_vinc" and cnpj_b is not None:
+                df_emp = df_empresas_vinc[
+                    df_empresas_vinc["cnpj_basico"].astype(str) == str(cnpj_b)
+                ].copy()
+
+                if not df_emp.empty:
+                    df_emp_info = (
+                        df_emp.drop_duplicates(subset=["cnpj_basico"])[
+                            [
+                                "cnpj_basico",
+                                "razao_social",
+                                "natureza_juridica_descricao",
+                                "capital_social",
+                            ]
+                        ]
+                    )
+                    st.markdown("**Empresa vinculada**")
+                    st.dataframe(df_emp_info)
+
+                    df_qsa_emp = df_emp[
+                        ["nome_socio", "documento", "qualificacao", "data_entrada_sociedade"]
+                    ].sort_values("nome_socio")
+                    st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
+                    st.dataframe(df_qsa_emp)
