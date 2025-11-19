@@ -816,15 +816,21 @@ if grafo_data is not None:
     with col_graph:
         st.markdown("### 🌐 Grafo do grupo econômico")
 
-        selection = cytoscape(
-            elements=elements,
-            stylesheet=stylesheet,
-            layout={"name": "preset", "fit": True, "padding": 140},
-            width="100%",
-            height="700px",  # quadrado
-            selection_type="additive",
-            key="grafo-cnpj",
-        )
+        with st.container(border=True):
+            selection = cytoscape(
+                elements=elements,
+                stylesheet=stylesheet,
+                layout={"name": "preset", "fit": True, "padding": 100},
+                width="100%",
+                height="700px",
+                selection_type="additive",
+                user_zooming_enabled=True,
+                user_panning_enabled=True,
+                min_zoom=0.3,
+                max_zoom=2.5,
+                key="grafo-cnpj",
+            )
+
 
     # nova seleção vinda do front
     new_selected_ids = selection.get("nodes", [])
@@ -961,3 +967,4 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
