@@ -64,7 +64,6 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # BIGQUERY CLIENT
 # ============================================================
 
-@st.cache_resource(show_spinner=False)
 def get_bq_client():
     """
     Cria o cliente BigQuery.
@@ -80,12 +79,10 @@ def get_bq_client():
         )
         project_id = creds.project_id
         client = bigquery.Client(project=project_id, credentials=creds)
-        log(f"BigQuery conectado via service account (projeto={project_id}).")
         return client
 
     # 2) Tenta ADC (local)
     client = bigquery.Client()
-    log(f"BigQuery conectado via ADC (projeto={client.project}).")
     return client
 
 
@@ -747,6 +744,7 @@ if run_btn:
         st.session_state["ultimo_cnpj"] = cnpj_basico
 
         client = get_bq_client()
+        log(f"BigQuery conectado no projeto: {client.project}")
 
         set_progress(15, "Consultando empresa foco...")
         df_empresa_foco = consultar_empresa_foco(client, cnpj_basico)
@@ -916,3 +914,4 @@ if run_btn:
         st.error(f"Erro durante a execução: {e}")
         log(f"ERRO: {e}")
         progress.empty()
+
