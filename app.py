@@ -217,22 +217,17 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
         dados.ano as ano,
         dados.mes as mes,
         dados.data as data,
-        dados.tipo as tipo,
+        dados.cnpj_basico as cnpj_basico,
+        descricao_tipo AS tipo,
         dados.nome as nome,
         dados.documento as documento,
-        dados.qualificacao as qualificacao,
-        dados.percentual_capital_social as percentual_capital_social,
+        descricao_qualificacao AS qualificacao,
         dados.data_entrada_sociedade as data_entrada_sociedade,
-        dados.id_pais as id_pais,
+        descricao_id_pais AS id_pais,
         dados.cpf_representante_legal as cpf_representante_legal,
         dados.nome_representante_legal as nome_representante_legal,
-        dados.qualificacao_representante_legal as qualificacao_representante_legal,
-        dados.faixa_etaria as faixa_etaria,
-        descricao_tipo,
-        descricao_qualificacao,
-        descricao_id_pais,
-        descricao_qualificacao_representante_legal,
-        descricao_faixa_etaria
+        descricao_qualificacao_representante_legal AS qualificacao_representante_legal,
+        descricao_faixa_etaria AS faixa_etaria
     FROM `basedosdados.br_me_cnpj.socios` AS dados
     LEFT JOIN dicionario_tipo
         ON dados.tipo = chave_tipo
@@ -245,7 +240,6 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
     LEFT JOIN dicionario_faixa_etaria
         ON dados.faixa_etaria = chave_faixa_etaria
     WHERE dados.cnpj_basico = @cnpj_basico
-    ORDER BY ano DESC, mes DESC, data DESC
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -256,184 +250,104 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
     return df
 
 
-def selecionar_qsa_atual(df_socios: pd.DataFrame) -> pd.DataFrame:
-    log("Filtrando QSA atual (ano + mes + data mais recente)...")
-    if df_socios.empty:
-        return df_socios
+def selecionar_qsa_atual(df_socios_foco: pd.DataFrame) -> pd.DataFrame:
+    """
+    QSA mais recente:
+    - maior data em df_socios_foco["data"]
+    - apenas linhas dessa data
+    - dedupe por nome
+    """
+    if df_socios_foco.empty:
+        return df_socios_foco
 
-    df_socios = df_socios.sort_values(["ano", "mes", "data"], ascending=False)
+    df = df_socios_foco.copy()
+    df["data"] = pd.to_datetime(df["data"])
+    data_max = df["data"].max()
+    df_qsa = df[df["data"] == data_max].copy()
 
-    primeiro = df_socios.iloc[0]
-    ano_ref = primeiro["ano"]
-    mes_ref = primeiro["mes"]
-    data_ref = primeiro["data"]
+    df_qsa = df_qsa.sort_values("data_entrada_sociedade", ascending=False)
+    df_qsa = df_qsa.drop_duplicates(subset=["nome"]).reset_index(drop=True)
 
-    df_qsa = df_socios[
-        (df_socios["ano"] == ano_ref)
-        & (df_socios["mes"] == mes_ref)
-        & (df_socios["data"] == data_ref)
-    ].copy()
-
-    log(f"QSA selecionado: {len(df_qsa)} registros (ano={ano_ref}, mes={mes_ref}, data={data_ref})")
+    log(f"QSA atual identificado em {data_max.date()}, {len(df_qsa)} sócios únicos.")
     return df_qsa
 
 
 def consultar_empresas_vinculadas_por_nome(
-    client: bigquery.Client,
-    df_socios_qsa: pd.DataFrame,
-    cnpj_basico_foco: str,
+    client: bigquery.Client, df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
 ) -> pd.DataFrame:
-    log("Consultando empresas vinculadas via nomes dos sócios...")
+    """Consulta empresas vinculadas usando NOME do sócio (não documento)."""
+    log("Consultando empresas vinculadas (por nome de sócio)...")
 
-    if df_socios_qsa.empty:
-        log("QSA vazio, pulando busca de empresas vinculadas.")
-        return pd.DataFrame()
-
-    nomes_socios = (
-        df_socios_qsa[df_socios_qsa["nome"].notna()]["nome"].unique().tolist()
-    )
-
+    nomes_socios = df_socios_qsa["nome"].dropna().unique().tolist()
     if not nomes_socios:
-        log("Nenhum nome de sócio disponível para busca.")
+        log("Nenhum nome de sócio encontrado no QSA atual.")
         return pd.DataFrame()
-
-    log(f"{len(nomes_socios)} nomes de sócios únicos para buscar empresas vinculadas.")
 
     sql = """
-    WITH 
-    dicionario_tipo AS (
-        SELECT
-            chave AS chave_tipo,
-            valor AS descricao_tipo
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'tipo'
-            AND id_tabela = 'socios'
+    WITH nomes_socios AS (
+        SELECT DISTINCT nome
+        FROM UNNEST(@lista_nomes) AS nome
     ),
-    dicionario_qualificacao AS (
+    socios_vinc AS (
         SELECT
-            chave AS chave_qualificacao,
-            valor AS descricao_qualificacao
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'qualificacao'
-            AND id_tabela = 'socios'
+            s.ano,
+            s.mes,
+            s.data,
+            s.cnpj_basico,
+            s.nome AS nome_socio,
+            s.documento,
+            s.qualificacao,
+            s.data_entrada_sociedade
+        FROM `basedosdados.br_me_cnpj.socios` AS s
+        JOIN nomes_socios n
+            ON s.nome = n.nome
     ),
-    dicionario_id_pais AS (
+    empresas_completa AS (
         SELECT
-            chave AS chave_id_pais,
-            valor AS descricao_id_pais
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'id_pais'
-            AND id_tabela = 'socios'
-    ),
-    dicionario_qualificacao_representante_legal AS (
-        SELECT
-            chave AS chave_qualificacao_representante_legal,
-            valor AS descricao_qualificacao_representante_legal
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'qualificacao_representante_legal'
-            AND id_tabela = 'socios'
-    ),
-    dicionario_faixa_etaria AS (
-        SELECT
-            chave AS chave_faixa_etaria,
-            valor AS descricao_faixa_etaria
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'faixa_etaria'
-            AND id_tabela = 'socios'
-    ),
-    dicionario_qualificacao_responsavel AS (
-        SELECT
-            chave AS chave_qualificacao_responsavel,
-            valor AS descricao_qualificacao_responsavel
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'qualificacao_responsavel'
-            AND id_tabela = 'empresas'
-    ),
-    dicionario_porte AS (
-        SELECT
-            chave AS chave_porte,
-            valor AS descricao_porte
-        FROM `basedosdados.br_me_cnpj.dicionario`
-        WHERE
-            nome_coluna = 'porte'
-            AND id_tabela = 'empresas'
+            e.ano,
+            e.mes,
+            e.data,
+            e.cnpj_basico,
+            e.razao_social,
+            e.natureza_juridica,
+            nj.descricao AS natureza_juridica_descricao,
+            e.capital_social
+        FROM `basedosdados.br_me_cnpj.empresas` AS e
+        LEFT JOIN `basedosdados.br_bd_diretorios_brasil.natureza_juridica` nj
+            ON e.natureza_juridica = nj.id_natureza_juridica
     )
     SELECT
-        s.ano as ano,
-        s.mes as mes,
-        s.data as data,
-        s.cnpj_basico as cnpj_basico,
-        s.tipo as tipo,
-        s.nome as nome_socio,
-        s.documento as documento,
-        s.qualificacao as qualificacao,
-        s.percentual_capital_social as percentual_capital_social,
-        s.data_entrada_sociedade as data_entrada_sociedade,
-        s.id_pais as id_pais,
-        s.cpf_representante_legal as cpf_representante_legal,
-        s.nome_representante_legal as nome_representante_legal,
-        s.qualificacao_representante_legal as qualificacao_representante_legal,
-        s.faixa_etaria as faixa_etaria,
-        descricao_tipo,
-        descricao_qualificacao,
-        descricao_id_pais,
-        descricao_qualificacao_representante_legal,
-        descricao_faixa_etaria,
-        e.razao_social as razao_social,
-        e.natureza_juridica as natureza_juridica,
-        diretorio_natureza_juridica.descricao AS natureza_juridica_descricao,
-        descricao_qualificacao_responsavel AS qualificacao_responsavel,
-        e.capital_social as capital_social,
-        descricao_porte AS porte,
-        e.ente_federativo as ente_federativo
-    FROM `basedosdados.br_me_cnpj.socios` AS s
-    LEFT JOIN dicionario_tipo
-        ON s.tipo = chave_tipo
-    LEFT JOIN dicionario_qualificacao
-        ON s.qualificacao = chave_qualificacao
-    LEFT JOIN dicionario_id_pais
-        ON s.id_pais = chave_id_pais
-    LEFT JOIN dicionario_qualificacao_representante_legal
-        ON s.qualificacao_representante_legal = chave_qualificacao_representante_legal
-    LEFT JOIN dicionario_faixa_etaria
-        ON s.faixa_etaria = chave_faixa_etaria
-    LEFT JOIN `basedosdados.br_me_cnpj.empresas` AS e
-        ON s.cnpj_basico = e.cnpj_basico
-        AND s.ano = e.ano
-        AND s.mes = e.mes
-        AND s.data = e.data
-    LEFT JOIN (
-        SELECT DISTINCT id_natureza_juridica, descricao
-        FROM `basedosdados.br_bd_diretorios_brasil.natureza_juridica`
-    ) AS diretorio_natureza_juridica
-        ON e.natureza_juridica = diretorio_natureza_juridica.id_natureza_juridica
-    LEFT JOIN dicionario_qualificacao_responsavel
-        ON e.qualificacao_responsavel = chave_qualificacao_responsavel
-    LEFT JOIN dicionario_porte
-        ON e.porte = chave_porte
-    WHERE s.nome IN UNNEST(@nomes_socios)
-      AND s.cnpj_basico != @cnpj_basico_foco
+        sv.nome_socio,
+        sv.documento,
+        sv.qualificacao,
+        sv.data_entrada_sociedade,
+        sv.cnpj_basico,
+        ec.razao_social,
+        ec.natureza_juridica_descricao,
+        ec.capital_social,
+        sv.ano,
+        sv.mes,
+        sv.data
+    FROM socios_vinc sv
+    LEFT JOIN empresas_completa ec
+        ON sv.cnpj_basico = ec.cnpj_basico
+    WHERE sv.cnpj_basico != @cnpj_foco
     """
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ArrayQueryParameter("nomes_socios", "STRING", nomes_socios),
-            bigquery.ScalarQueryParameter("cnpj_basico_foco", "STRING", cnpj_basico_foco),
+            bigquery.ArrayQueryParameter("lista_nomes", "STRING", nomes_socios),
+            bigquery.ScalarQueryParameter("cnpj_foco", "STRING", cnpj_basico_foco),
         ]
     )
+
     df = client.query(sql, job_config=job_config).to_dataframe()
-    log(f"{len(df)} registros de empresas vinculadas retornados.")
+    log(f"Empresas vinculadas consultadas: {len(df)} linhas.")
     return df
 
 
 # ============================================================
-# CONSTRUÇÃO DO GRAFO (NetworkX)
+# GRAFO (NETWORKX)
 # ============================================================
 
 def construir_grafo(
@@ -442,336 +356,396 @@ def construir_grafo(
     df_empresas_vinc: pd.DataFrame,
     cnpj_basico_foco: str,
 ) -> nx.Graph:
-    log("Construindo grafo (NetworkX)...")
+    """
+    Grafo:
+    - nó foco (empresa raiz)
+    - nós sócios (PF/PJ) ligados ao foco
+    - nós empresas vinculadas ligadas aos sócios
+    """
     G = nx.Graph()
 
-    # -----------------------------------------------------------
-    # 1) Nó "FOCO" (empresa foco)
-    # -----------------------------------------------------------
-    row_emp = df_empresa_foco.iloc[0]
-    razao_foco = row_emp["razao_social"]
-    label_foco = f"{razao_foco}\n(CNPJ: {cnpj_basico_foco})"
+    if df_empresa_foco.empty:
+        raise ValueError("Empresa foco não encontrada no CNPJ básico informado.")
 
+    row_foco = df_empresa_foco.iloc[0]
+    foco_id = "FOCO"
     G.add_node(
-        "FOCO",
-        label=label_foco,
-        tipo="empresa",
+        foco_id,
         nivel="foco",
-        nome=razao_foco,
+        tipo="PJ",
+        label=row_foco["razao_social"],
+        nome=row_foco["razao_social"],
         cnpj_basico=cnpj_basico_foco,
         eh_empresa_foco=True,
     )
 
-    # -----------------------------------------------------------
-    # 2) Sócios da empresa foco (nível "socio")
-    # -----------------------------------------------------------
-    for idx, row in df_socios_qsa.iterrows():
-        nome_socio = row.get("nome")
-        if not nome_socio or pd.isna(nome_socio):
-            continue
+    # sócios do QSA atual
+    socios_qsa = df_socios_qsa.copy()
+    socios_qsa = socios_qsa.dropna(subset=["nome"])
+    socios_qsa = socios_qsa.drop_duplicates(subset=["nome"]).reset_index(drop=True)
 
-        node_id_socio = f"SOCIO_{nome_socio}"
+    map_nome_to_node = {}
 
-        doc = row.get("documento", "")
-        tipo_val = row.get("descricao_tipo", row.get("tipo", ""))
+    for i, r in socios_qsa.iterrows():
+        nome = r["nome"]
+        tipo_str = str(r["tipo"] or "")
+        tipo_node = "PF" if "Física" in tipo_str else "PJ"
+        node_id = f"SOC_{i}"
 
-        if not G.has_node(node_id_socio):
-            label_socio = f"{nome_socio}\n({tipo_val})"
-            G.add_node(
-                node_id_socio,
-                label=label_socio,
-                tipo="socio",
-                nivel="socio",
-                nome=nome_socio,
-                cnpj_basico=None,
-            )
-
-        qual = row.get("descricao_qualificacao", row.get("qualificacao", ""))
-        perc = row.get("percentual_capital_social")
-        perc_str = f"{perc}%" if perc and not pd.isna(perc) else ""
-
-        edge_label = f"{qual}\n{perc_str}".strip()
-
+        G.add_node(
+            node_id,
+            nivel="socio",
+            tipo=tipo_node,
+            label=nome,
+            nome=nome,
+            documento=r.get("documento", None),
+            cnpj_basico=None,
+            eh_empresa_foco=False,
+        )
         G.add_edge(
-            "FOCO",
-            node_id_socio,
-            label=edge_label,
+            node_id,
+            foco_id,
+            tipo_relacao="sociedade_foco",
+            qualificacao=r.get("qualificacao", None),
+            data_entrada=str(r.get("data_entrada_sociedade", "")),
         )
 
-    # -----------------------------------------------------------
-    # 3) Empresas vinculadas (nível "empresa_vinc")
-    #    Fazemos dedup por (cnpj_basico, nome_socio) último registro
-    # -----------------------------------------------------------
-    df_vinc_sorted = df_empresas_vinc.copy()
-    df_vinc_sorted["data"] = pd.to_datetime(df_vinc_sorted["data"], errors="coerce")
-    df_vinc_sorted = df_vinc_sorted.sort_values(
-        ["cnpj_basico", "nome_socio", "data"], ascending=[True, True, False]
-    )
-    df_vinc_dedup = df_vinc_sorted.drop_duplicates(
-        subset=["cnpj_basico", "nome_socio"], keep="first"
-    )
+        map_nome_to_node[nome] = node_id
 
-    for idx, row in df_vinc_dedup.iterrows():
-        cnpj_emp = row["cnpj_basico"]
-        razao_emp = row["razao_social"]
-        nome_socio = row["nome_socio"]
+    # empresas vinculadas
+    if not df_empresas_vinc.empty:
+        emp_unique = (
+            df_empresas_vinc.dropna(subset=["cnpj_basico"])
+            .drop_duplicates(subset=["cnpj_basico"])
+            .reset_index(drop=True)
+        )
 
-        if not cnpj_emp or pd.isna(cnpj_emp):
-            continue
-        if not razao_emp or pd.isna(razao_emp):
-            razao_emp = f"(CNPJ: {cnpj_emp})"
+        for _, r in emp_unique.iterrows():
+            cnpj_b = str(r["cnpj_basico"])
+            emp_id = f"EMP_{cnpj_b}"
 
-        node_id_emp = f"EMP_{cnpj_emp}"
-
-        if not G.has_node(node_id_emp):
-            label_emp = f"{razao_emp}\n(CNPJ: {cnpj_emp})"
             G.add_node(
-                node_id_emp,
-                label=label_emp,
-                tipo="empresa",
+                emp_id,
                 nivel="empresa_vinc",
-                nome=razao_emp,
-                cnpj_basico=str(cnpj_emp),
+                tipo="PJ",
+                label=r["razao_social"],
+                nome=r["razao_social"],
+                cnpj_basico=cnpj_b,
+                eh_empresa_foco=False,
             )
 
-        node_id_socio = f"SOCIO_{nome_socio}"
-        if G.has_node(node_id_socio):
-            qual = row.get("descricao_qualificacao", row.get("qualificacao", ""))
-            perc = row.get("percentual_capital_social")
-            perc_str = f"{perc}%" if perc and not pd.isna(perc) else ""
+        # ligações sócio–empresa
+        for _, r in df_empresas_vinc.iterrows():
+            nome_socio = r["nome_socio"]
+            socio_id = map_nome_to_node.get(nome_socio)
+            cnpj_b = r["cnpj_basico"]
+            if socio_id is None or pd.isna(cnpj_b):
+                continue
+            emp_id = f"EMP_{cnpj_b}"
 
-            edge_label = f"{qual}\n{perc_str}".strip()
+            if emp_id not in G.nodes:
+                continue
 
+            # Graph simples: múltiplas chamadas mantêm 1 aresta
             G.add_edge(
-                node_id_emp,
-                node_id_socio,
-                label=edge_label,
+                socio_id,
+                emp_id,
+                tipo_relacao="sociedade",
+                qualificacao=r.get("qualificacao", None),
+                data_entrada=str(r.get("data_entrada_sociedade", "")),
             )
+
+    degree_dict = dict(G.degree())
+    nx.set_node_attributes(G, degree_dict, "degree")
+
+    # label fixo pra foco + sócios
+    for n, data in G.nodes(data=True):
+        nivel = data.get("nivel")
+        label_vis = (n == foco_id) or (nivel == "socio")
+        data["label_visible"] = "true" if label_vis else "false"
 
     log(f"Grafo construído: {G.number_of_nodes()} nós, {G.number_of_edges()} arestas.")
     return G
 
 
 # ============================================================
-# LAYOUT E ELEMENTOS CYTOSCAPE
+# LAYOUT E ELEMENTOS CYTOSCAPE (spring + anel flexível)
 # ============================================================
 
-def compute_positions(G: nx.Graph, foco_id: str, seed: int = 42, k: float = 2.0):
-    """
-    Usa spring_layout para posicionar nós, forçando 'foco_id' no centro.
-    """
-    log("Calculando layout de posições dos nós (spring layout)...")
-    pos = nx.spring_layout(G, seed=seed, k=k)
+SCALE = 700.0
+R_MIN_SOCIOS = 300.0
+R_MAX_SOCIOS = 1000.0
 
-    if foco_id in pos:
-        pos[foco_id] = (0, 0)
 
+def compute_positions(G: nx.Graph, foco_id: str = "FOCO", seed: int = 42, k: float = 2.0):
+    log(f"Calculando layout (spring) com seed={seed}, k={k}...")
+    pos = nx.spring_layout(
+        G,
+        k=k,
+        iterations=4000,
+        seed=seed,
+        weight=None,
+    )
+
+    cx, cy = pos[foco_id]
+    for n in pos:
+        x, y = pos[n]
+        pos[n] = ((x - cx) * SCALE, (y - cy) * SCALE)
+
+    socios_ids = [n for n, d in G.nodes(data=True) if d.get("nivel") == "socio"]
+    R_inner = 0.8 * R_MIN_SOCIOS
+
+    pos[foco_id] = (0.0, 0.0)
+
+    # empresas dentro do círculo interno
+    for n, data in G.nodes(data=True):
+        if n == foco_id:
+            continue
+        if data.get("nivel") == "empresa_vinc":
+            x, y = pos[n]
+            r = math.hypot(x, y)
+            if r > 0 and r > R_inner:
+                fator = R_inner / r
+                pos[n] = (x * fator, y * fator)
+
+    # sócios com raio entre min e max, mantendo ângulo do spring
+    for sid in socios_ids:
+        x, y = pos[sid]
+        r = math.hypot(x, y)
+        if r == 0:
+            r = (R_MIN_SOCIOS + R_MAX_SOCIOS) / 2.0
+            theta = 2 * math.pi * (hash(sid) % 360) / 360.0
+            x, y = r * math.cos(theta), r * math.sin(theta)
+        else:
+            r_clamped = max(R_MIN_SOCIOS, min(R_MAX_SOCIOS, r))
+            fator = r_clamped / r
+            x, y = x * fator, y * fator
+        pos[sid] = (x, y)
+
+    log("Layout calculado.")
     return pos
 
 
-def build_cytoscape_elements(G: nx.Graph, pos: dict, selected_ids: list):
+def build_cytoscape_elements(G: nx.Graph, pos, selected_ids):
     """
-    Monta lista de elementos (nós e arestas) para o cytoscape.
-    selected_ids é uma lista de IDs de nós selecionados (para highlight).
+    Monta elements do Cytoscape, com atributos de highlight (self/neighbor/dim/none)
+    e highlight das arestas (connected/dim/none), igual à lógica da célula 7.
     """
     elements = []
+    selected = set(selected_ids or [])
+    neighbor_ids = set()
 
-    # Converte posições para pixels
-    xvals = [xy[0] for xy in pos.values()]
-    yvals = [xy[1] for xy in pos.values()]
-    xmin, xmax = min(xvals), max(xvals)
-    ymin, ymax = min(yvals), max(yvals)
+    if selected:
+        for sid in selected:
+            if sid in G:
+                neighbor_ids |= set(G.neighbors(sid))
 
-    margin = 100
-    canvas_width = 1500
-    canvas_height = 1500
+    # nós
+    for nid, data in G.nodes(data=True):
+        x, y = pos[nid]
 
-    def scale_x(x):
-        if xmax == xmin:
-            return canvas_width / 2
-        return margin + (x - xmin) / (xmax - xmin) * (canvas_width - 2 * margin)
+        # highlight do nó
+        if not selected:
+            h_node = "none"
+        elif nid in selected:
+            h_node = "self"
+        elif nid in neighbor_ids:
+            h_node = "neighbor"
+        else:
+            h_node = "dim"
 
-    def scale_y(y):
-        if ymax == ymin:
-            return canvas_height / 2
-        return margin + (y - ymin) / (ymax - ymin) * (canvas_height - 2 * margin)
+        node_entry = {
+            "data": {
+                "id": nid,
+                "label": data.get("label", ""),
+                "tipo": data.get("tipo", ""),
+                "nivel": data.get("nivel", ""),
+                "eh_empresa_foco": str(bool(data.get("eh_empresa_foco", False))).lower(),
+                "degree": int(data.get("degree", 0)),
+                "label_visible": data.get("label_visible", "false"),
+                "highlight": h_node,
+            },
+            "position": {"x": float(x), "y": float(y)},
+            # 👇 LINHA NOVA: mantém o nó selecionado após o rerun
+            "selected": nid in selected,
+        }
+        elements.append(node_entry)
 
-    # Nós
-    for node_id in G.nodes():
-        data = G.nodes[node_id]
-        nivel = data.get("nivel")
-        tipo = data.get("tipo")
+    # arestas
+    for u, v, data in G.edges(data=True):
+        if not selected:
+            h_edge = "none"
+        elif u in selected or v in selected:
+            h_edge = "connected"
+        else:
+            h_edge = "dim"
 
-        x, y = pos.get(node_id, (0, 0))
-        px = scale_x(x)
-        py = scale_y(y)
-
-        classes = []
-        if nivel == "foco":
-            classes.append("foco")
-        elif nivel == "socio":
-            classes.append("socio")
-        elif nivel == "empresa_vinc":
-            classes.append("empresa-vinc")
-
-        if node_id in selected_ids:
-            classes.append("selected")
-
-        elements.append(
-            {
-                "data": {
-                    "id": node_id,
-                    "label": data.get("label", node_id),
-                    "tipo": tipo,
-                    "nivel": nivel,
-                },
-                "position": {"x": px, "y": py},
-                "classes": " ".join(classes),
-                "selected": (node_id in selected_ids),
+        edge_entry = {
+            "data": {
+                "id": f"{u}__{v}",
+                "source": u,
+                "target": v,
+                "tipo_relacao": data.get("tipo_relacao", ""),
+                "qualificacao": data.get("qualificacao", ""),
+                "data_entrada": str(data.get("data_entrada", "")),
+                "highlight": h_edge,
             }
-        )
-
-    # Arestas
-    for u, v, edge_data in G.edges(data=True):
-        edge_id = f"{u}-{v}"
-        
-        classes = []
-        # Se ambos os nós estão selecionados, destacar a aresta
-        if u in selected_ids and v in selected_ids:
-            classes.append("highlighted")
-
-        elements.append(
-            {
-                "data": {
-                    "id": edge_id,
-                    "source": u,
-                    "target": v,
-                    "label": edge_data.get("label", ""),
-                },
-                "classes": " ".join(classes),
-            }
-        )
+        }
+        elements.append(edge_entry)
 
     return elements
 
 
 def get_stylesheet():
-    """
-    Stylesheet para o Cytoscape.
-    """
+    """Estilo com highlight igual à célula 7."""
     return [
-        # Nós em geral
+        # base
         {
             "selector": "node",
             "style": {
+                "width": "mapData(degree, 0, 20, 12, 40)",
+                "height": "mapData(degree, 0, 20, 12, 40)",
+                "border-width": 1,
+                "border-color": "#555",
+                "opacity": 1.0,
+            },
+        },
+        # PF azul
+        {
+            "selector": "node[tipo = 'PF']",
+            "style": {"background-color": "#1f77b4"},
+        },
+        # PJ branca
+        {
+            "selector": "node[tipo = 'PJ']",
+            "style": {"background-color": "#ffffff"},
+        },
+        # foco verde
+        {
+            "selector": "node[eh_empresa_foco = 'true']",
+            "style": {
+                "background-color": "#2ca02c",
+                "border-width": 3,
+            },
+        },
+        # labels fixos (foco + sócios)
+        {
+            "selector": "node[label_visible = 'true']",
+            "style": {
                 "label": "data(label)",
+                "font-size": "10px",
                 "text-valign": "center",
                 "text-halign": "center",
-                "font-size": "12px",
-                "text-wrap": "wrap",
-                "text-max-width": "120px",
-                "background-color": "#999",
+                "color": "#000000",
+            },
+        },
+        # nós apagados
+        {
+            "selector": "node[highlight = 'dim']",
+            "style": {
+                "opacity": 0.15,
+            },
+        },
+        # nó selecionado
+        {
+            "selector": "node[highlight = 'self']",
+            "style": {
+                "opacity": 1.0,
+                "border-width": 4,
+                "border-color": "#000000",
+                "label": "data(label)",
+                "font-size": "11px",
+            },
+        },
+        # vizinhos
+        {
+            "selector": "node[highlight = 'neighbor']",
+            "style": {
+                "opacity": 0.95,
                 "border-width": 2,
-                "border-color": "#666",
-                "width": 60,
-                "height": 60,
+                "border-color": "#333333",
+                "label": "data(label)",
+                "font-size": "10px",
             },
         },
-        # Nó Foco (empresa foco)
+        # fallback para node:selected (caso o front selecione direto)
         {
-            "selector": "node.foco",
-            "style": {
-                "background-color": "#FF6B6B",
-                "border-color": "#C92A2A",
-                "width": 80,
-                "height": 80,
-                "font-size": "14px",
-                "font-weight": "bold",
-            },
-        },
-        # Sócio
-        {
-            "selector": "node.socio",
-            "style": {
-                "background-color": "#4ECDC4",
-                "border-color": "#0A9698",
-                "shape": "ellipse",
-            },
-        },
-        # Empresa Vinculada
-        {
-            "selector": "node.empresa-vinc",
-            "style": {
-                "background-color": "#95E1D3",
-                "border-color": "#38A89D",
-            },
-        },
-        # Nó selecionado
-        {
-            "selector": "node.selected",
+            "selector": "node:selected",
             "style": {
                 "border-width": 4,
-                "border-color": "#FFD700",
-                "background-color": "#FFA500",
+                "border-color": "#000000",
             },
         },
-        # Arestas em geral
+        # arestas base
         {
             "selector": "edge",
             "style": {
-                "width": 2,
-                "line-color": "#ccc",
-                "target-arrow-color": "#ccc",
-                "target-arrow-shape": "triangle",
+                "line-color": "#bbbbbb",
+                "width": 1,
                 "curve-style": "bezier",
-                "label": "data(label)",
-                "font-size": "10px",
-                "text-rotation": "autorotate",
-                "text-background-opacity": 1,
-                "text-background-color": "#fff",
-                "text-background-padding": "3px",
+                "opacity": 0.6,
             },
         },
-        # Aresta destacada (quando ambos nós estão selecionados)
+        # arestas apagadas
         {
-            "selector": "edge.highlighted",
+            "selector": "edge[highlight = 'dim']",
             "style": {
-                "width": 4,
-                "line-color": "#FFD700",
-                "target-arrow-color": "#FFD700",
+                "opacity": 0.1,
             },
         },
-        # Nós selecionados (estado interno do cytoscape)
+        # arestas conectadas a nós selecionados
         {
-            "selector": ":selected",
+            "selector": "edge[highlight = 'connected']",
             "style": {
-                "border-width": 4,
-                "border-color": "#FFD700",
+                "line-color": "#555555",
+                "width": 2,
+                "opacity": 0.95,
             },
         },
     ]
 
 
 # ============================================================
-# INTERFACE: BUSCA
+# UI PRINCIPAL
 # ============================================================
 
-with st.form("form_cnpj"):
+col_input, col_info = st.columns([2, 1])
+
+with col_input:
     cnpj_input = st.text_input(
-        "Digite o CNPJ (14 dígitos, com ou sem separadores):",
-        placeholder="00.000.000/0000-00",
+        "CNPJ da empresa foco",
+        value="54.651.716/0001-88",
+        help="Pode informar com ou sem separadores.",
     )
-    submitted = st.form_submit_button("🔍 Buscar grupo econômico", use_container_width=True)
+    run_btn = st.button("🚀 Gerar análise", type="primary")
 
-if submitted and cnpj_input.strip():
-    progress = st.empty()
+with col_info:
+    st.markdown("### Sobre")
+    st.markdown(
+        "- Base: `basedosdados.br_me_cnpj.*`\n"
+        "- Nível 1: empresa foco\n"
+        "- Nível 2: sócios do QSA atual\n"
+        "- Nível 3: empresas em que esses sócios aparecem no QSA"
+    )
 
-    def set_progress(perc: int, msg: str):
-        progress.progress(perc / 100, text=msg)
+progress = st.empty()
 
+
+def set_progress(pct: int, msg: str):
+    progress.progress(pct / 100.0, text=msg)
+    log(msg)
+
+
+# ------------------------------------------------------------
+# EXECUÇÃO (ETL + GRAFO) – apenas ao clicar
+# ------------------------------------------------------------
+if run_btn:
     try:
+        st.session_state["logs"] = []
+        render_logs()
+
         set_progress(5, "Normalizando CNPJ...")
-        cnpj_14 = normalizar_cnpj(cnpj_input.strip())
+        cnpj_14 = normalizar_cnpj(cnpj_input)
         cnpj_basico = extrair_cnpj_basico(cnpj_14)
         st.session_state["ultimo_cnpj"] = cnpj_basico
 
@@ -847,7 +821,7 @@ if grafo_data is not None:
             stylesheet=stylesheet,
             layout={"name": "preset", "fit": True, "padding": 140},
             width="100%",
-            height="700px",
+            height="700px",  # quadrado
             selection_type="additive",
             key="grafo-cnpj",
         )
@@ -855,12 +829,12 @@ if grafo_data is not None:
     # nova seleção vinda do front
     new_selected_ids = selection.get("nodes", [])
 
-    # CORREÇÃO: apenas atualiza o session_state, SEM fazer st.rerun()
-    # Isso permite que o componente cytoscape mantenha seu estado interno de seleção
+    # se mudou, atualiza estado e rerun para reaplicar highlight
     if new_selected_ids != selected_ids_state:
         st.session_state["selected_nodes"] = new_selected_ids
+        st.rerun()
 
-    # usa a seleção do session_state para mostrar detalhes
+    # se chegou aqui, selecionados no estado já estão sincronizados com o highlight
     selected_ids = st.session_state.get("selected_nodes", [])
 
     with col_tables:
