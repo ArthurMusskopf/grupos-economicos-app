@@ -62,6 +62,19 @@ render_logs()
 st.sidebar.markdown("### ⚙️ Log de execução")
 
 # ============================================================
+# LIMITES DE BYTES (BIGQUERY) E CACHE
+# ============================================================
+
+# Limites de bytes processados por query (em bytes)
+# Objetivo: manter ~10 GiB por análise no pior caso (<< 1 TB / 100 análises/mês)
+MAX_BYTES_EMPRESA_FOCO = 1 * 1024**3       # ~1 GiB
+MAX_BYTES_SOCIOS_FOCO = 2 * 1024**3        # ~2 GiB
+MAX_BYTES_EMP_VINC = 8 * 1024**3           # ~8 GiB
+
+# Cache de 24h, até 200 CNPJs diferentes
+CACHE_TTL = 60 * 60 * 24
+
+# ============================================================
 # BIGQUERY CLIENT
 # ============================================================
 
@@ -104,11 +117,14 @@ def extrair_cnpj_basico(cnpj_14: str) -> str:
 
 
 # ============================================================
-# QUERIES BIGQUERY (NÃO CACHEADAS)
+# QUERIES BIGQUERY (CORE – SEM STREAMLIT DENTRO)
 # ============================================================
 
 def consultar_empresa_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataFrame:
-    log("Consultando empresa foco (tabela empresas)...")
+    """
+    Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
+    limitada por MAX_BYTES_EMPRESA_FOCO.
+    """
     sql = """
     WITH 
     dicionario_qualificacao_responsavel AS (
@@ -158,14 +174,18 @@ def consultar_empresa_foco(client: bigquery.Client, cnpj_basico: str) -> pd.Data
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico)
-        ]
+        ],
+        maximum_bytes_billed=MAX_BYTES_EMPRESA_FOCO,
     )
     df = client.query(sql, job_config=job_config).to_dataframe()
     return df
 
 
 def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataFrame:
-    log("Consultando sócios da empresa foco (tabela socios)...")
+    """
+    Consulta todos os sócios da empresa foco em br_me_cnpj.socios,
+    limitada por MAX_BYTES_SOCIOS_FOCO.
+    """
     sql = """
     WITH 
     dicionario_tipo AS (
@@ -244,7 +264,8 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico)
-        ]
+        ],
+        maximum_bytes_billed=MAX_BYTES_SOCIOS_FOCO,
     )
     df = client.query(sql, job_config=job_config).to_dataframe()
     return df
@@ -277,26 +298,19 @@ def consultar_empresas_vinculadas_por_nome(
 ) -> pd.DataFrame:
     """
     Consulta empresas vinculadas usando NOME do sócio (não documento),
-    **somente no snapshot mais recente** (mesma data do QSA da empresa foco),
-    com deduplicação no BigQuery e limite de bytes para reduzir custo.
+    SOMENTE no snapshot mais recente (mesma data do QSA da empresa foco),
+    restringindo 'empresas' apenas aos CNPJs que aparecem em 'socios_vinc'
+    e deduplicando por (nome_socio, cnpj_basico).
 
-    - Usa df_socios_qsa["data"] para definir a data de referência (data_ref).
-    - Filtra socios e empresas em data = data_ref (1 partição).
-    - Deduplica por (nome_socio, cnpj_basico) via QUALIFY ROW_NUMBER().
-    - Define maximum_bytes_billed ≈ 3 GB para manter o custo por análise
-      bem abaixo de 1 TB / 100 consultas por mês.
+    Limitada por MAX_BYTES_EMP_VINC.
     """
-    log("Consultando empresas vinculadas (por nome de sócio, snapshot mais recente)...")
-
     # 1) Garante que temos QSA
     if df_socios_qsa.empty:
-        log("QSA atual vazio, não há empresas vinculadas a consultar.")
         return pd.DataFrame()
 
     # 2) Lista de nomes dos sócios da empresa foco
     nomes_socios = df_socios_qsa["nome"].dropna().unique().tolist()
     if not nomes_socios:
-        log("Nenhum nome de sócio encontrado no QSA atual.")
         return pd.DataFrame()
 
     # 3) Define a data de referência = mesma 'data' usada no QSA atual
@@ -304,9 +318,11 @@ def consultar_empresas_vinculadas_por_nome(
     df_tmp["data"] = pd.to_datetime(df_tmp["data"])
     data_ref = df_tmp["data"].max()
     data_ref_str = data_ref.strftime("%Y-%m-%d")
-    log(f"Usando snapshot de dados em {data_ref_str} para empresas vinculadas.")
 
-    # 4) Query otimizada (particionada + QUALIFY)
+    # 4) Query otimizada:
+    #    - filtra socios por data_ref
+    #    - extrai CNPJs relevantes (cnpjs_socios)
+    #    - filtra empresas por esses CNPJs + data_ref
     sql = """
     WITH nomes_socios AS (
         SELECT DISTINCT nome
@@ -325,7 +341,12 @@ def consultar_empresas_vinculadas_por_nome(
         FROM `basedosdados.br_me_cnpj.socios` AS s
         JOIN nomes_socios n
             ON s.nome = n.nome
-        WHERE s.data = @data_ref              -- 🔥 usa só o snapshot da data_ref
+        WHERE s.data = @data_ref
+    ),
+    cnpjs_socios AS (
+        SELECT DISTINCT cnpj_basico
+        FROM socios_vinc
+        WHERE cnpj_basico IS NOT NULL
     ),
     empresas_completa AS (
         SELECT
@@ -338,9 +359,11 @@ def consultar_empresas_vinculadas_por_nome(
             nj.descricao AS natureza_juridica_descricao,
             e.capital_social
         FROM `basedosdados.br_me_cnpj.empresas` AS e
+        JOIN cnpjs_socios c
+            ON e.cnpj_basico = c.cnpj_basico
         LEFT JOIN `basedosdados.br_bd_diretorios_brasil.natureza_juridica` nj
             ON e.natureza_juridica = nj.id_natureza_juridica
-        WHERE e.data = @data_ref              -- 🔥 mesma foto em empresas
+        WHERE e.data = @data_ref
     ),
     joined AS (
         SELECT
@@ -360,7 +383,6 @@ def consultar_empresas_vinculadas_por_nome(
             ON sv.cnpj_basico = ec.cnpj_basico
         WHERE sv.cnpj_basico != @cnpj_foco
     )
-    -- 🔥 dedup por (nome_socio, cnpj_basico): pega o registro mais recente
     SELECT *
     FROM joined
     QUALIFY ROW_NUMBER()
@@ -368,40 +390,33 @@ def consultar_empresas_vinculadas_por_nome(
                  ORDER BY data DESC, data_entrada_sociedade DESC) = 1
     """
 
-    # 5) Limite de bytes por consulta (~3 GB)
-    MAX_BYTES_PER_QUERY = 3 * 1024**3  # 3 GB
-
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ArrayQueryParameter("lista_nomes", "STRING", nomes_socios),
             bigquery.ScalarQueryParameter("cnpj_foco", "STRING", cnpj_basico_foco),
             bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref_str),
         ],
-        maximum_bytes_billed=MAX_BYTES_PER_QUERY,
+        maximum_bytes_billed=MAX_BYTES_EMP_VINC,
     )
 
     df = client.query(sql, job_config=job_config).to_dataframe()
-    log(f"Empresas vinculadas consultadas (deduplicadas): {len(df)} linhas.")
     return df
+
 
 # ============================================================
 # WRAPPERS CACHEADOS (USADOS PELO APP)
 # ============================================================
 
-# Cache de 24h, com até 200 CNPJs diferentes
-CACHE_TTL = 60 * 60 * 24
-
-
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def cached_consultar_empresa_foco(cnpj_basico: str) -> pd.DataFrame:
-    """Wrapper cacheado para empresa foco."""
+    """Wrapper cacheado para empresa foco (sem log dentro)."""
     client = get_bq_client()
     return consultar_empresa_foco(client, cnpj_basico)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def cached_consultar_socios_foco(cnpj_basico: str) -> pd.DataFrame:
-    """Wrapper cacheado para sócios da empresa foco."""
+    """Wrapper cacheado para sócios da empresa foco (sem log dentro)."""
     client = get_bq_client()
     return consultar_socios_foco(client, cnpj_basico)
 
@@ -410,7 +425,7 @@ def cached_consultar_socios_foco(cnpj_basico: str) -> pd.DataFrame:
 def cached_consultar_empresas_vinculadas_por_nome(
     df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
 ) -> pd.DataFrame:
-    """Wrapper cacheado para empresas vinculadas por nome de sócio."""
+    """Wrapper cacheado para empresas vinculadas (sem log dentro)."""
     client = get_bq_client()
     return consultar_empresas_vinculadas_por_nome(client, df_socios_qsa, cnpj_basico_foco)
 
@@ -515,7 +530,6 @@ def construir_grafo(
             if emp_id not in G.nodes:
                 continue
 
-            # Graph simples: múltiplas chamadas mantêm 1 aresta
             G.add_edge(
                 socio_id,
                 emp_id,
@@ -836,11 +850,12 @@ if run_btn:
         set_progress(45, "Selecionando QSA mais recente...")
         df_socios_qsa = selecionar_qsa_atual(df_socios_foco)
 
-        # --- EMPRESAS VINCULADAS (cacheado) ---
+        # --- EMPRESAS VINCULADAS (cacheado, otimizado) ---
         set_progress(60, "Consultando empresas vinculadas...")
         df_empresas_vinc = cached_consultar_empresas_vinculadas_por_nome(
             df_socios_qsa, cnpj_basico
         )
+        log(f"Empresas vinculadas consultadas (deduplicadas): {len(df_empresas_vinc)} linhas.")
 
         set_progress(75, "Construindo grafo...")
         G = construir_grafo(df_empresa_foco, df_socios_qsa, df_empresas_vinc, cnpj_basico)
@@ -963,7 +978,6 @@ if grafo_data is not None:
 
                 # SÓCIO (PF/PJ)
                 elif nivel == "socio" and nome is not None:
-                    # registro do sócio na empresa foco (mais recente primeiro)
                     df_socio_foco = (
                         df_socios_qsa[df_socios_qsa["nome"] == nome]
                         .sort_values("data_entrada_sociedade", ascending=False)
@@ -1038,4 +1052,3 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
-
