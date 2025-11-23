@@ -104,7 +104,7 @@ def extrair_cnpj_basico(cnpj_14: str) -> str:
 
 
 # ============================================================
-# QUERIES BIGQUERY
+# QUERIES BIGQUERY (NÃO CACHEADAS)
 # ============================================================
 
 def consultar_empresa_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataFrame:
@@ -212,78 +212,34 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
         WHERE
             nome_coluna = 'faixa_etaria'
             AND id_tabela = 'socios'
-    ),
-    socios_raw AS (
-        SELECT
-            dados.ano as ano,
-            dados.mes as mes,
-            dados.data as data,
-            dados.cnpj_basico as cnpj_basico,
-            descricao_tipo AS tipo,
-            dados.nome as nome,
-            dados.documento as documento,
-            descricao_qualificacao AS qualificacao,
-            dados.data_entrada_sociedade as data_entrada_sociedade,
-            descricao_id_pais AS id_pais,
-            dados.cpf_representante_legal as cpf_representante_legal,
-            dados.nome_representante_legal as nome_representante_legal,
-            descricao_qualificacao_representante_legal AS qualificacao_representante_legal,
-            descricao_faixa_etaria AS faixa_etaria
-        FROM `basedosdados.br_me_cnpj.socios` AS dados
-        LEFT JOIN dicionario_tipo
-            ON dados.tipo = chave_tipo
-        LEFT JOIN dicionario_qualificacao
-            ON dados.qualificacao = chave_qualificacao
-        LEFT JOIN dicionario_id_pais
-            ON dados.id_pais = chave_id_pais
-        LEFT JOIN dicionario_qualificacao_representante_legal
-            ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
-        LEFT JOIN dicionario_faixa_etaria
-            ON dados.faixa_etaria = chave_faixa_etaria
-        WHERE dados.cnpj_basico = @cnpj_basico
-    ),
-    max_data AS (
-        SELECT
-            MAX(data) AS data_max
-        FROM socios_raw
-    ),
-    qsa_atual AS (
-        SELECT
-            s.*
-        FROM socios_raw s
-        CROSS JOIN max_data m
-        WHERE s.data = m.data_max
-    ),
-    qsa_dedup AS (
-        SELECT
-            *
-        FROM (
-            SELECT
-                q.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY q.nome
-                    ORDER BY q.data_entrada_sociedade DESC
-                ) AS rn
-            FROM qsa_atual q
-        )
-        WHERE rn = 1
     )
     SELECT
-        ano,
-        mes,
-        data,
-        cnpj_basico,
-        tipo,
-        nome,
-        documento,
-        qualificacao,
-        data_entrada_sociedade,
-        id_pais,
-        cpf_representante_legal,
-        nome_representante_legal,
-        qualificacao_representante_legal,
-        faixa_etaria
-    FROM qsa_dedup
+        dados.ano as ano,
+        dados.mes as mes,
+        dados.data as data,
+        dados.cnpj_basico as cnpj_basico,
+        descricao_tipo AS tipo,
+        dados.nome as nome,
+        dados.documento as documento,
+        descricao_qualificacao AS qualificacao,
+        dados.data_entrada_sociedade as data_entrada_sociedade,
+        descricao_id_pais AS id_pais,
+        dados.cpf_representante_legal as cpf_representante_legal,
+        dados.nome_representante_legal as nome_representante_legal,
+        descricao_qualificacao_representante_legal AS qualificacao_representante_legal,
+        descricao_faixa_etaria AS faixa_etaria
+    FROM `basedosdados.br_me_cnpj.socios` AS dados
+    LEFT JOIN dicionario_tipo
+        ON dados.tipo = chave_tipo
+    LEFT JOIN dicionario_qualificacao
+        ON dados.qualificacao = chave_qualificacao
+    LEFT JOIN dicionario_id_pais
+        ON dados.id_pais = chave_id_pais
+    LEFT JOIN dicionario_qualificacao_representante_legal
+        ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
+    LEFT JOIN dicionario_faixa_etaria
+        ON dados.faixa_etaria = chave_faixa_etaria
+    WHERE dados.cnpj_basico = @cnpj_basico
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -297,14 +253,23 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
 def selecionar_qsa_atual(df_socios_foco: pd.DataFrame) -> pd.DataFrame:
     """
     QSA mais recente:
-    Agora já é retornado diretamente pela consulta SQL.
-    Mantido apenas para compatibilidade com o restante do código.
+    - maior data em df_socios_foco["data"]
+    - apenas linhas dessa data
+    - dedupe por nome
     """
     if df_socios_foco.empty:
         return df_socios_foco
 
-    log("QSA atual já filtrado/deduplicado na consulta SQL.")
-    return df_socios_foco
+    df = df_socios_foco.copy()
+    df["data"] = pd.to_datetime(df["data"])
+    data_max = df["data"].max()
+    df_qsa = df[df["data"] == data_max].copy()
+
+    df_qsa = df_qsa.sort_values("data_entrada_sociedade", ascending=False)
+    df_qsa = df_qsa.drop_duplicates(subset=["nome"]).reset_index(drop=True)
+
+    log(f"QSA atual identificado em {data_max.date()}, {len(df_qsa)} sócios únicos.")
+    return df_qsa
 
 
 def consultar_empresas_vinculadas_por_nome(
@@ -337,20 +302,6 @@ def consultar_empresas_vinculadas_por_nome(
         JOIN nomes_socios n
             ON s.nome = n.nome
     ),
-    socios_vinc_dedup AS (
-        SELECT
-            *
-        FROM (
-            SELECT
-                sv.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY sv.nome_socio, sv.cnpj_basico
-                    ORDER BY sv.data DESC, sv.data_entrada_sociedade DESC
-                ) AS rn
-            FROM socios_vinc sv
-        )
-        WHERE rn = 1
-    ),
     empresas_completa AS (
         SELECT
             e.ano,
@@ -377,7 +328,7 @@ def consultar_empresas_vinculadas_por_nome(
         sv.ano,
         sv.mes,
         sv.data
-    FROM socios_vinc_dedup sv
+    FROM socios_vinc sv
     LEFT JOIN empresas_completa ec
         ON sv.cnpj_basico = ec.cnpj_basico
     WHERE sv.cnpj_basico != @cnpj_foco
@@ -393,6 +344,37 @@ def consultar_empresas_vinculadas_por_nome(
     df = client.query(sql, job_config=job_config).to_dataframe()
     log(f"Empresas vinculadas consultadas: {len(df)} linhas.")
     return df
+
+
+# ============================================================
+# WRAPPERS CACHEADOS (USADOS PELO APP)
+# ============================================================
+
+# Cache de 24h, com até 200 CNPJs diferentes
+CACHE_TTL = 60 * 60 * 24
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
+def cached_consultar_empresa_foco(cnpj_basico: str) -> pd.DataFrame:
+    """Wrapper cacheado para empresa foco."""
+    client = get_bq_client()
+    return consultar_empresa_foco(client, cnpj_basico)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
+def cached_consultar_socios_foco(cnpj_basico: str) -> pd.DataFrame:
+    """Wrapper cacheado para sócios da empresa foco."""
+    client = get_bq_client()
+    return consultar_socios_foco(client, cnpj_basico)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
+def cached_consultar_empresas_vinculadas_por_nome(
+    df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
+) -> pd.DataFrame:
+    """Wrapper cacheado para empresas vinculadas por nome de sócio."""
+    client = get_bq_client()
+    return consultar_empresas_vinculadas_por_nome(client, df_socios_qsa, cnpj_basico_foco)
 
 
 # ============================================================
@@ -615,7 +597,7 @@ def build_cytoscape_elements(G: nx.Graph, pos, selected_ids):
                 "highlight": h_node,
             },
             "position": {"x": float(x), "y": float(y)},
-            # 👇 LINHA NOVA: mantém o nó selecionado após o rerun
+            # mantém o nó selecionado após o rerun
             "selected": nid in selected,
         }
         elements.append(node_entry)
@@ -717,7 +699,7 @@ def get_stylesheet():
                 "font-size": "10px",
             },
         },
-        # fallback para node:selected (caso o front selecione direto)
+        # fallback para node:selected
         {
             "selector": "node:selected",
             "style": {
@@ -801,22 +783,25 @@ if run_btn:
         client = get_bq_client()
         log(f"BigQuery conectado no projeto: {client.project}")
 
+        # --- EMPRESA FOCO (cacheado) ---
         set_progress(15, "Consultando empresa foco...")
-        df_empresa_foco = consultar_empresa_foco(client, cnpj_basico)
+        df_empresa_foco = cached_consultar_empresa_foco(cnpj_basico)
         if df_empresa_foco.empty:
             st.error("Empresa foco não encontrada para esse CNPJ.")
             progress.empty()
             st.stop()
 
+        # --- SÓCIOS EMPRESA FOCO (cacheado) ---
         set_progress(30, "Consultando sócios da empresa foco...")
-        df_socios_foco = consultar_socios_foco(client, cnpj_basico)
+        df_socios_foco = cached_consultar_socios_foco(cnpj_basico)
 
         set_progress(45, "Selecionando QSA mais recente...")
         df_socios_qsa = selecionar_qsa_atual(df_socios_foco)
 
+        # --- EMPRESAS VINCULADAS (cacheado) ---
         set_progress(60, "Consultando empresas vinculadas...")
-        df_empresas_vinc = consultar_empresas_vinculadas_por_nome(
-            client, df_socios_qsa, cnpj_basico
+        df_empresas_vinc = cached_consultar_empresas_vinculadas_por_nome(
+            df_socios_qsa, cnpj_basico
         )
 
         set_progress(75, "Construindo grafo...")
@@ -879,7 +864,6 @@ if grafo_data is not None:
                 max_zoom=2.5,
                 key="grafo-cnpj",
             )
-
 
     # nova seleção vinda do front
     new_selected_ids = selection.get("nodes", [])
