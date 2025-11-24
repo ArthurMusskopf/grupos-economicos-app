@@ -98,6 +98,7 @@ def get_bq_client():
     client = bigquery.Client()
     return client
 
+
 # ============================================================
 # SNAPSHOT MAIS RECENTE (PARTIÇÕES) - EMPRESAS / SÓCIOS
 # ============================================================
@@ -108,26 +109,30 @@ def get_latest_snapshots() -> dict:
     Retorna as últimas datas de snapshot (por partição) para
     as tabelas 'empresas' e 'socios' do br_me_cnpj.
     Usa INFORMATION_SCHEMA.PARTITIONS (quase custo zero).
+
+    Usa SAFE.PARSE_DATE para evitar erro em partition_id inválido
+    (ex.: 'NULL', '__UNPARTITIONED__', etc.).
     """
     client = get_bq_client()
     sql = """
     SELECT
       table_name,
-      MAX(PARSE_DATE('%Y%m%d', partition_id)) AS data_ref
+      MAX(SAFE.PARSE_DATE('%Y%m%d', partition_id)) AS data_ref
     FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
     WHERE table_name IN ('empresas', 'socios')
-      AND partition_id IS NOT NULL
-      AND partition_id != '__UNPARTITIONED__'
     GROUP BY table_name
     """
     df = client.query(sql).to_dataframe()
 
     result = {}
     for _, row in df.iterrows():
-        # data_ref é um objeto date; convertemos pra 'YYYY-MM-DD'
+        # pode ter linhas sem data_ref válida (SAFE.PARSE_DATE retorna NULL)
+        if pd.isna(row["data_ref"]):
+            continue
         result[row["table_name"]] = row["data_ref"].isoformat()
 
     return result
+
 
 # ============================================================
 # HELPERS DE CNPJ
@@ -159,6 +164,9 @@ def consultar_empresa_foco(
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
     usando APENAS o snapshot da data_ref (partição por data).
     """
+    if not data_ref:
+        raise ValueError("Data de referência para 'empresas' não encontrada.")
+
     sql = """
     WITH 
     dicionario_qualificacao_responsavel AS (
@@ -201,7 +209,7 @@ def consultar_empresa_foco(
         ON dados.qualificacao_responsavel = chave_qualificacao_responsavel
     LEFT JOIN dicionario_porte
         ON dados.porte = chave_porte
-    WHERE dados.data = @data_ref          -- 🔴 filtro direto na partição
+    WHERE dados.data = @data_ref          -- filtro direto na partição
       AND dados.cnpj_basico = @cnpj_basico
     ORDER BY ano DESC, mes DESC, data DESC
     LIMIT 1
@@ -228,6 +236,9 @@ def consultar_socios_foco(
     SOMENTE no snapshot indicado por data_ref (partição por data),
     limitada por MAX_BYTES_SOCIOS_FOCO.
     """
+    if not data_ref:
+        raise ValueError("Data de referência para 'socios' não encontrada.")
+
     sql = """
     WITH 
     dicionario_tipo AS (
@@ -301,7 +312,7 @@ def consultar_socios_foco(
         ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
     LEFT JOIN dicionario_faixa_etaria
         ON dados.faixa_etaria = chave_faixa_etaria
-    WHERE dados.data = @data_ref          -- 🔴 filtro direto na partição
+    WHERE dados.data = @data_ref          -- filtro direto na partição
       AND dados.cnpj_basico = @cnpj_basico
     """
 
@@ -314,6 +325,7 @@ def consultar_socios_foco(
     )
     df = client.query(sql, job_config=job_config).to_dataframe()
     return df
+
 
 def selecionar_qsa_atual(df_socios_foco: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1094,5 +1106,3 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
-
-
