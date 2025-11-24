@@ -110,10 +110,7 @@ def get_latest_snapshots() -> dict:
     """
     Retorna as últimas datas de snapshot (por partição) para
     as tabelas 'empresas' e 'socios' do br_me_cnpj.
-    Usa INFORMATION_SCHEMA.PARTITIONS (quase custo zero).
-
-    Usa SAFE.PARSE_DATE para evitar erro em partition_id inválido
-    (ex.: 'NULL', '__UNPARTITIONED__', etc.).
+    Usa INFORMATION_SCHEMA.PARTITIONS (custo praticamente zero).
     """
     client = get_bq_client()
     sql = """
@@ -128,13 +125,11 @@ def get_latest_snapshots() -> dict:
 
     result = {}
     for _, row in df.iterrows():
-        # pode ter linhas sem data_ref válida (SAFE.PARSE_DATE retorna NULL)
-        if pd.isna(row["data_ref"]):
-            continue
-        result[row["table_name"]] = row["data_ref"].isoformat()
+        if row["data_ref"] is not None:
+            # data_ref é um objeto date; convertemos pra 'YYYY-MM-DD'
+            result[row["table_name"]] = row["data_ref"].isoformat()
 
     return result
-
 
 # ============================================================
 # HELPERS DE CNPJ
@@ -1108,5 +1103,6 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
