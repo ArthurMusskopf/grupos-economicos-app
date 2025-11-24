@@ -789,7 +789,7 @@ def get_stylesheet():
             "style": {
                 "line-color": "#555555",
                 "width": 2,
-                "opacity": 0.95",
+                "opacity": 0.95,
             },
         },
     ]
@@ -1059,3 +1059,4 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
