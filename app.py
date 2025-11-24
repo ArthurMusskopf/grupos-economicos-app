@@ -67,9 +67,9 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 
 # Limites de bytes processados por query (em bytes)
 # Objetivo: manter ~10 GiB por análise no pior caso (<< 1 TB / 100 análises/mês)
-MAX_BYTES_EMPRESA_FOCO = 1 * 1024**3       # ~1 GiB
-MAX_BYTES_SOCIOS_FOCO = 2 * 1024**3        # ~2 GiB
-MAX_BYTES_EMP_VINC = 8 * 1024**3           # ~8 GiB
+MAX_BYTES_EMPRESA_FOCO = 3 * 1024**3       # ~3 GiB
+MAX_BYTES_SOCIOS_FOCO = 3 * 1024**3        # ~3 GiB
+MAX_BYTES_EMP_VINC = 4 * 1024**3           # ~4 GiB
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -123,10 +123,14 @@ def extrair_cnpj_basico(cnpj_14: str) -> str:
 def consultar_empresa_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataFrame:
     """
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
-    limitada por MAX_BYTES_EMPRESA_FOCO.
+    limitada por MAX_BYTES_EMPRESA_FOCO e usando apenas o snapshot mais recente (partição por data).
     """
     sql = """
     WITH 
+    ultima_data AS (
+        SELECT MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.empresas`
+    ),
     dicionario_qualificacao_responsavel AS (
         SELECT
             chave AS chave_qualificacao_responsavel,
@@ -158,6 +162,8 @@ def consultar_empresa_foco(client: bigquery.Client, cnpj_basico: str) -> pd.Data
         descricao_porte AS porte,
         dados.ente_federativo as ente_federativo
     FROM `basedosdados.br_me_cnpj.empresas` AS dados
+    JOIN ultima_data ud
+        ON dados.data = ud.data_ref
     LEFT JOIN (
         SELECT DISTINCT id_natureza_juridica, descricao
         FROM `basedosdados.br_bd_diretorios_brasil.natureza_juridica`
@@ -184,10 +190,15 @@ def consultar_empresa_foco(client: bigquery.Client, cnpj_basico: str) -> pd.Data
 def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataFrame:
     """
     Consulta todos os sócios da empresa foco em br_me_cnpj.socios,
+    SOMENTE no snapshot mais recente (partição por data),
     limitada por MAX_BYTES_SOCIOS_FOCO.
     """
     sql = """
     WITH 
+    ultima_data AS (
+        SELECT MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.socios`
+    ),
     dicionario_tipo AS (
         SELECT
             chave AS chave_tipo,
@@ -249,6 +260,8 @@ def consultar_socios_foco(client: bigquery.Client, cnpj_basico: str) -> pd.DataF
         descricao_qualificacao_representante_legal AS qualificacao_representante_legal,
         descricao_faixa_etaria AS faixa_etaria
     FROM `basedosdados.br_me_cnpj.socios` AS dados
+    JOIN ultima_data ud
+        ON dados.data = ud.data_ref
     LEFT JOIN dicionario_tipo
         ON dados.tipo = chave_tipo
     LEFT JOIN dicionario_qualificacao
@@ -304,25 +317,19 @@ def consultar_empresas_vinculadas_por_nome(
 
     Limitada por MAX_BYTES_EMP_VINC.
     """
-    # 1) Garante que temos QSA
     if df_socios_qsa.empty:
         return pd.DataFrame()
 
-    # 2) Lista de nomes dos sócios da empresa foco
     nomes_socios = df_socios_qsa["nome"].dropna().unique().tolist()
     if not nomes_socios:
         return pd.DataFrame()
 
-    # 3) Define a data de referência = mesma 'data' usada no QSA atual
+    # data de referência = mesma 'data' do QSA atual
     df_tmp = df_socios_qsa.copy()
     df_tmp["data"] = pd.to_datetime(df_tmp["data"])
     data_ref = df_tmp["data"].max()
     data_ref_str = data_ref.strftime("%Y-%m-%d")
 
-    # 4) Query otimizada:
-    #    - filtra socios por data_ref
-    #    - extrai CNPJs relevantes (cnpjs_socios)
-    #    - filtra empresas por esses CNPJs + data_ref
     sql = """
     WITH nomes_socios AS (
         SELECT DISTINCT nome
@@ -782,7 +789,7 @@ def get_stylesheet():
             "style": {
                 "line-color": "#555555",
                 "width": 2,
-                "opacity": 0.95,
+                "opacity": 0.95",
             },
         },
     ]
