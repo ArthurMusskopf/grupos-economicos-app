@@ -113,16 +113,18 @@ def get_latest_snapshots() -> dict:
     sql = """
     SELECT
       table_name,
-      MAX(DATE(partition_id)) AS data_ref
+      MAX(PARSE_DATE('%Y%m%d', partition_id)) AS data_ref
     FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
     WHERE table_name IN ('empresas', 'socios')
+      AND partition_id IS NOT NULL
+      AND partition_id != '__UNPARTITIONED__'
     GROUP BY table_name
     """
     df = client.query(sql).to_dataframe()
 
     result = {}
     for _, row in df.iterrows():
-        # data_ref vem como datetime.date; convertemos pra string 'YYYY-MM-DD'
+        # data_ref é um objeto date; convertemos pra 'YYYY-MM-DD'
         result[row["table_name"]] = row["data_ref"].isoformat()
 
     return result
@@ -1092,4 +1094,5 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
