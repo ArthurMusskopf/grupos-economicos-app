@@ -67,9 +67,9 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 
 # Limites de bytes processados por query (em bytes)
 # Objetivo: manter ~10 GiB por análise no pior caso
-MAX_BYTES_EMPRESA_FOCO = 4 * 1024**3       # ~4 GiB
-MAX_BYTES_SOCIOS_FOCO  = 3 * 1024**3       # ~3 GiB
-MAX_BYTES_EMP_VINC     = 4 * 1024**3       # ~4 GiB
+MAX_BYTES_EMPRESA_FOCO = 7 * 1024**3       # ~4 GiB
+MAX_BYTES_SOCIOS_FOCO  = 7 * 1024**3       # ~3 GiB
+MAX_BYTES_EMP_VINC     = 7 * 1024**3       # ~4 GiB
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -1106,3 +1106,4 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
