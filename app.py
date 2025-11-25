@@ -2,7 +2,7 @@ import re
 import math
 import time
 from datetime import datetime, date
-import calendar
+import calendar  # ainda que não usado, deixei aqui pra não mudar demais teu topo
 
 import streamlit as st
 import pandas as pd
@@ -110,33 +110,34 @@ def get_bq_client():
 def _gerar_datas_candidatas(max_meses_retrocesso: int = 2):
     """
     Gera datas da forma:
-    - mês atual: dia 10 até o dia 1 (decrescente)
-    - mês anterior: dia 10 até o dia 1 (decrescente)
+    - mês atual: do dia 10 até o dia 1 (decrescente)
+    - mês anterior: do dia 10 até o dia 1 (decrescente)
+    Sempre ignorando dias no futuro.
     """
     hoje = datetime.utcnow().date()
-    ano = hoje.year
-    mes = hoje.month
+    ano_base = hoje.year
+    mes_base = hoje.month
 
     for offset_mes in range(max_meses_retrocesso):
-        ano_atual = ano
-        mes_atual = mes - offset_mes
+        ano_atual = ano_base
+        mes_atual = mes_base - offset_mes
         while mes_atual <= 0:
             mes_atual += 12
             ano_atual -= 1
 
-        _, dias_no_mes = calendar.monthrange(ano_atual, mes_atual)
-        ultimo_dia = min(30, dias_no_mes)
-
-        for dia in range(ultimo_dia, 0, -1):  # 10, 9, ..., 1
-            yield date(ano_atual, mes_atual, dia)
+        for dia in range(10, 0, -1):  # 10, 9, ..., 1
+            d = date(ano_atual, mes_atual, dia)
+            if d > hoje:
+                continue
+            yield d
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
     """
-    Descobre a última data de snapshot para o CNPJ na tabela de SÓCIOS,
-    procurando do dia 30 até o dia 1 do mês atual e do mês anterior,
-    usando partição DIÁRIA via decorator: socios$YYYYMMDD.
+    Descobre a última data de snapshot para o CNPJ na tabela de EMPRESAS,
+    procurando do dia 10 até o dia 1 do mês atual e do mês anterior,
+    usando partição DIÁRIA via decorator: empresas$YYYYMMDD.
 
     Retorna 'YYYY-MM-DD' ou None.
     """
@@ -146,8 +147,8 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
         part = d.strftime("%Y%m%d")
         sql = f"""
         SELECT 1
-        FROM `basedosdados.br_me_cnpj.empresas${part}` AS s
-        WHERE s.cnpj_basico = @cnpj_basico
+        FROM `basedosdados.br_me_cnpj.empresas${part}` AS e
+        WHERE e.cnpj_basico = @cnpj_basico
         LIMIT 1
         """
         job_config = bigquery.QueryJobConfig(
@@ -160,7 +161,7 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
         try:
             df = client.query(sql, job_config=job_config).to_dataframe()
         except Exception as e:
-            # Se der erro de bytes ou algo pontual na partição, só registra e continua
+            # Se der erro (tabela/partição inexistente, bytes, etc.), registra e segue
             log(f"Falha ao checar snapshot {d.isoformat()} para {cnpj_basico}: {e}")
             continue
 
@@ -171,7 +172,7 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
 
     log(
         f"Nenhum snapshot encontrado para {cnpj_basico} "
-        f"entre os dias 1 e 30 do mês atual e anterior."
+        f"entre os dias 10 e 1 do mês atual e do anterior."
     )
     return None
 
@@ -394,11 +395,14 @@ def selecionar_qsa_atual(df_socios_foco: pd.DataFrame) -> pd.DataFrame:
 
 
 def consultar_empresas_vinculadas_por_nome(
-    client: bigquery.Client, df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
+    client: bigquery.Client,
+    df_socios_qsa: pd.DataFrame,
+    cnpj_basico_foco: str,
+    data_ref: str,
 ) -> pd.DataFrame:
     """
     Consulta empresas vinculadas usando NOME do sócio (não documento),
-    SOMENTE no snapshot do QSA atual (data do df_socios_qsa),
+    SOMENTE no snapshot indicado por data_ref (mesmo snapshot da empresa foco),
     restringindo 'empresas' apenas aos CNPJs que aparecem em 'socios_vinc'
     e deduplicando por (nome_socio, cnpj_basico).
 
@@ -411,15 +415,10 @@ def consultar_empresas_vinculadas_por_nome(
     if not nomes_socios:
         return pd.DataFrame()
 
-    # data de referência = mesma 'data' do QSA atual
-    df_tmp = df_socios_qsa.copy()
-    df_tmp["data"] = pd.to_datetime(df_tmp["data"], errors="coerce")
-    data_ref = df_tmp["data"].max()
-    if pd.isna(data_ref):
-        return pd.DataFrame()
+    if not data_ref:
+        raise ValueError("Data de referência para empresas vinculadas não informada.")
 
-    data_ref_str = data_ref.strftime("%Y-%m-%d")
-    part = data_ref_str.replace("-", "")
+    part = data_ref.replace("-", "")
     tabela_socios = f"`basedosdados.br_me_cnpj.socios${part}`"
     tabela_empresas = f"`basedosdados.br_me_cnpj.empresas${part}`"
 
@@ -505,33 +504,30 @@ def consultar_empresas_vinculadas_por_nome(
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
-def cached_consultar_empresa_foco(cnpj_basico: str) -> pd.DataFrame:
+def cached_consultar_empresa_foco(cnpj_basico: str, data_ref: str) -> pd.DataFrame:
     """Wrapper cacheado para empresa foco (sem log dentro)."""
     client = get_bq_client()
-    data_ref = get_data_ref_for_cnpj(cnpj_basico)
-    if not data_ref:
-        # Deixa vazio; a camada de UI mostra mensagem amigável
-        return pd.DataFrame()
     return consultar_empresa_foco(client, cnpj_basico, data_ref)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
-def cached_consultar_socios_foco(cnpj_basico: str) -> pd.DataFrame:
+def cached_consultar_socios_foco(cnpj_basico: str, data_ref: str) -> pd.DataFrame:
     """Wrapper cacheado para sócios da empresa foco (sem log dentro)."""
     client = get_bq_client()
-    data_ref = get_data_ref_for_cnpj(cnpj_basico)
-    if not data_ref:
-        return pd.DataFrame()
     return consultar_socios_foco(client, cnpj_basico, data_ref)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def cached_consultar_empresas_vinculadas_por_nome(
-    df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
+    df_socios_qsa: pd.DataFrame,
+    cnpj_basico_foco: str,
+    data_ref: str,
 ) -> pd.DataFrame:
     """Wrapper cacheado para empresas vinculadas (sem log dentro)."""
     client = get_bq_client()
-    return consultar_empresas_vinculadas_por_nome(client, df_socios_qsa, cnpj_basico_foco)
+    return consultar_empresas_vinculadas_por_nome(
+        client, df_socios_qsa, cnpj_basico_foco, data_ref
+    )
 
 
 # ============================================================
@@ -848,7 +844,7 @@ def get_stylesheet():
         {
             "selector": "node[highlight = 'neighbor']",
             "style": {
-                "opacity": 0.95,
+                "opacity": 0.95",
                 "border-width": 2,
                 "border-color": "#333333",
                 "label": "data(label)",
@@ -939,22 +935,23 @@ if run_btn:
         client = get_bq_client()
         log(f"BigQuery conectado no projeto: {client.project}")
 
-        # --- EMPRESA FOCO (cacheado) ---
-        set_progress(15, "Descobrindo snapshot (1–10, mês atual + anterior)...")
+        # --- DATA_REF (dia 10 → 1, mês atual + anterior) ---
+        set_progress(15, "Descobrindo snapshot (dias 10 → 1, mês atual + anterior)...")
         data_ref = get_data_ref_for_cnpj(cnpj_basico)
 
         if not data_ref:
             st.error(
                 "Empresa foco não encontrada nas janelas de snapshot "
-                "(dias 1 a 10 do mês atual e do anterior)."
+                "(dias 10 a 1 do mês atual e do anterior)."
             )
             progress.empty()
             st.stop()
 
         log(f"Usando snapshot {data_ref} para todas as consultas.")
 
+        # --- EMPRESA FOCO (cacheado) ---
         set_progress(25, "Consultando empresa foco...")
-        df_empresa_foco = consultar_empresa_foco(client, cnpj_basico, data_ref)
+        df_empresa_foco = cached_consultar_empresa_foco(cnpj_basico, data_ref)
         if df_empresa_foco.empty:
             st.error("Empresa foco não encontrada para esse CNPJ no snapshot escolhido.")
             progress.empty()
@@ -962,15 +959,15 @@ if run_btn:
 
         # --- SÓCIOS EMPRESA FOCO (cacheado) ---
         set_progress(40, "Consultando sócios da empresa foco...")
-        df_socios_foco = consultar_socios_foco(client, cnpj_basico, data_ref)
+        df_socios_foco = cached_consultar_socios_foco(cnpj_basico, data_ref)
 
         set_progress(55, "Selecionando QSA mais recente...")
         df_socios_qsa = selecionar_qsa_atual(df_socios_foco)
 
-        # --- EMPRESAS VINCULADAS (cacheado, otimizado) ---
+        # --- EMPRESAS VINCULADAS (cacheado, mesmo snapshot) ---
         set_progress(70, "Consultando empresas vinculadas...")
         df_empresas_vinc = cached_consultar_empresas_vinculadas_por_nome(
-            df_socios_qsa, cnpj_basico
+            df_socios_qsa, cnpj_basico, data_ref
         )
         log(f"Empresas vinculadas consultadas (deduplicadas): {len(df_empresas_vinc)} linhas.")
 
@@ -1169,6 +1166,3 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
-
-
-
