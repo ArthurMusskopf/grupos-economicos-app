@@ -844,7 +844,7 @@ def get_stylesheet():
         {
             "selector": "node[highlight = 'neighbor']",
             "style": {
-                "opacity": 0.95",
+                "opacity": 0.95,
                 "border-width": 2,
                 "border-color": "#333333",
                 "label": "data(label)",
@@ -1166,3 +1166,4 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
