@@ -1,4 +1,4 @@
-import re
+saimport re
 import math
 import time
 from datetime import datetime, date
@@ -146,7 +146,7 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
         part = d.strftime("%Y%m%d")
         sql = f"""
         SELECT 1
-        FROM `basedosdados.br_me_cnpj.socios${part}` AS s
+        FROM `basedosdados.br_me_cnpj.empresas${part}` AS s
         WHERE s.cnpj_basico = @cnpj_basico
         LIMIT 1
         """
@@ -1169,3 +1169,4 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
