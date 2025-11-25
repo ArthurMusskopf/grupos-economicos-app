@@ -68,9 +68,9 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # Limites de bytes processados por query (em bytes)
 # Mantemos folga de até ~10 GiB por query, mas o uso real deve ficar
 # bem abaixo disso por conta dos filtros de partição por data.
-MAX_BYTES_EMPRESA_FOCO = 10 * 1024**3
-MAX_BYTES_SOCIOS_FOCO  = 10 * 1024**3
-MAX_BYTES_EMP_VINC     = 10 * 1024**3
+MAX_BYTES_EMPRESA_FOCO = 12 * 1024**3
+MAX_BYTES_SOCIOS_FOCO  = 12 * 1024**3
+MAX_BYTES_EMP_VINC     = 12 * 1024**3
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -1060,3 +1060,4 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
