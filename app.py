@@ -2,7 +2,7 @@ import re
 import math
 import time
 from datetime import datetime, date
-import calendar  # ainda que não usado, deixei aqui pra não mudar demais teu topo
+import calendar
 
 import streamlit as st
 import pandas as pd
@@ -110,26 +110,25 @@ def get_bq_client():
 def _gerar_datas_candidatas(max_meses_retrocesso: int = 2):
     """
     Gera datas da forma:
-    - mês atual: do dia 10 até o dia 1 (decrescente)
-    - mês anterior: do dia 10 até o dia 1 (decrescente)
-    Sempre ignorando dias no futuro.
+    - mês atual: dia 10 até o dia 1 (decrescente)
+    - mês anterior: dia 10 até o dia 1 (decrescente)
     """
     hoje = datetime.utcnow().date()
-    ano_base = hoje.year
-    mes_base = hoje.month
+    ano = hoje.year
+    mes = hoje.month
 
     for offset_mes in range(max_meses_retrocesso):
-        ano_atual = ano_base
-        mes_atual = mes_base - offset_mes
+        ano_atual = ano
+        mes_atual = mes - offset_mes
         while mes_atual <= 0:
             mes_atual += 12
             ano_atual -= 1
 
-        for dia in range(10, 0, -1):  # 10, 9, ..., 1
-            d = date(ano_atual, mes_atual, dia)
-            if d > hoje:
-                continue
-            yield d
+        _, dias_no_mes = calendar.monthrange(ano_atual, mes_atual)
+        ultimo_dia = min(10, dias_no_mes)
+
+        for dia in range(ultimo_dia, 0, -1):  # 10, 9, ..., 1
+            yield date(ano_atual, mes_atual, dia)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
@@ -137,23 +136,25 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
     """
     Descobre a última data de snapshot para o CNPJ na tabela de EMPRESAS,
     procurando do dia 10 até o dia 1 do mês atual e do mês anterior,
-    usando partição DIÁRIA via decorator: empresas$YYYYMMDD.
+    usando partição DIÁRIA via coluna _PARTITIONDATE.
 
     Retorna 'YYYY-MM-DD' ou None.
     """
     client = get_bq_client()
+    log(f"Descobrindo snapshot (dias 10 → 1, mês atual + anterior) para {cnpj_basico}...")
 
     for d in _gerar_datas_candidatas(max_meses_retrocesso=2):
-        part = d.strftime("%Y%m%d")
-        sql = f"""
+        sql = """
         SELECT 1
-        FROM `basedosdados.br_me_cnpj.empresas${part}` AS e
-        WHERE e.cnpj_basico = @cnpj_basico
+        FROM `basedosdados.br_me_cnpj.empresas`
+        WHERE _PARTITIONDATE = @data_ref
+          AND cnpj_basico = @cnpj_basico
         LIMIT 1
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico)
+                bigquery.ScalarQueryParameter("data_ref", "DATE", d),
+                bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
             ],
             maximum_bytes_billed=MAX_BYTES_DETECCAO,
         )
@@ -161,7 +162,7 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
         try:
             df = client.query(sql, job_config=job_config).to_dataframe()
         except Exception as e:
-            # Se der erro (tabela/partição inexistente, bytes, etc.), registra e segue
+            # Se der erro pontual na partição, só registra e continua
             log(f"Falha ao checar snapshot {d.isoformat()} para {cnpj_basico}: {e}")
             continue
 
@@ -205,15 +206,12 @@ def consultar_empresa_foco(
 ) -> pd.DataFrame:
     """
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
-    usando APENAS o snapshot de data_ref (partição diária via decorator).
+    usando APENAS o snapshot de data_ref (partição diária via _PARTITIONDATE).
     """
     if not data_ref:
         raise ValueError("Data de referência para 'empresas' não informada.")
 
-    part = data_ref.replace("-", "")
-    tabela_empresas = f"`basedosdados.br_me_cnpj.empresas${part}`"
-
-    sql = f"""
+    sql = """
     WITH 
     dicionario_qualificacao_responsavel AS (
         SELECT
@@ -245,7 +243,7 @@ def consultar_empresa_foco(
         dados.capital_social as capital_social,
         descricao_porte AS porte,
         dados.ente_federativo as ente_federativo
-    FROM {tabela_empresas} AS dados
+    FROM `basedosdados.br_me_cnpj.empresas` AS dados
     LEFT JOIN (
         SELECT DISTINCT id_natureza_juridica, descricao
         FROM `basedosdados.br_bd_diretorios_brasil.natureza_juridica`
@@ -255,7 +253,8 @@ def consultar_empresa_foco(
         ON dados.qualificacao_responsavel = chave_qualificacao_responsavel
     LEFT JOIN dicionario_porte
         ON dados.porte = chave_porte
-    WHERE dados.cnpj_basico = @cnpj_basico
+    WHERE _PARTITIONDATE = @data_ref
+      AND dados.cnpj_basico = @cnpj_basico
     ORDER BY ano DESC, mes DESC, data DESC
     LIMIT 1
     """
@@ -263,6 +262,7 @@ def consultar_empresa_foco(
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
+            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref),
         ],
         maximum_bytes_billed=MAX_BYTES_EMPRESA_FOCO,
     )
@@ -277,16 +277,13 @@ def consultar_socios_foco(
 ) -> pd.DataFrame:
     """
     Consulta todos os sócios da empresa foco em br_me_cnpj.socios,
-    SOMENTE no snapshot indicado por data_ref (partição diária via decorator),
+    SOMENTE no snapshot indicado por data_ref (partição diária via _PARTITIONDATE),
     limitada por MAX_BYTES_SOCIOS_FOCO.
     """
     if not data_ref:
         raise ValueError("Data de referência para 'socios' não informada.")
 
-    part = data_ref.replace("-", "")
-    tabela_socios = f"`basedosdados.br_me_cnpj.socios${part}`"
-
-    sql = f"""
+    sql = """
     WITH 
     dicionario_tipo AS (
         SELECT
@@ -348,7 +345,7 @@ def consultar_socios_foco(
         dados.nome_representante_legal as nome_representante_legal,
         descricao_qualificacao_representante_legal AS qualificacao_representante_legal,
         descricao_faixa_etaria AS faixa_etaria
-    FROM {tabela_socios} AS dados
+    FROM `basedosdados.br_me_cnpj.socios` AS dados
     LEFT JOIN dicionario_tipo
         ON dados.tipo = chave_tipo
     LEFT JOIN dicionario_qualificacao
@@ -359,12 +356,14 @@ def consultar_socios_foco(
         ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
     LEFT JOIN dicionario_faixa_etaria
         ON dados.faixa_etaria = chave_faixa_etaria
-    WHERE dados.cnpj_basico = @cnpj_basico
+    WHERE _PARTITIONDATE = @data_ref
+      AND dados.cnpj_basico = @cnpj_basico
     """
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
+            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref),
         ],
         maximum_bytes_billed=MAX_BYTES_SOCIOS_FOCO,
     )
@@ -395,14 +394,11 @@ def selecionar_qsa_atual(df_socios_foco: pd.DataFrame) -> pd.DataFrame:
 
 
 def consultar_empresas_vinculadas_por_nome(
-    client: bigquery.Client,
-    df_socios_qsa: pd.DataFrame,
-    cnpj_basico_foco: str,
-    data_ref: str,
+    client: bigquery.Client, df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
 ) -> pd.DataFrame:
     """
     Consulta empresas vinculadas usando NOME do sócio (não documento),
-    SOMENTE no snapshot indicado por data_ref (mesmo snapshot da empresa foco),
+    SOMENTE no snapshot do QSA atual (data do df_socios_qsa),
     restringindo 'empresas' apenas aos CNPJs que aparecem em 'socios_vinc'
     e deduplicando por (nome_socio, cnpj_basico).
 
@@ -415,17 +411,24 @@ def consultar_empresas_vinculadas_por_nome(
     if not nomes_socios:
         return pd.DataFrame()
 
-    if not data_ref:
-        raise ValueError("Data de referência para empresas vinculadas não informada.")
+    # data de referência = mesma 'data' do QSA atual
+    df_tmp = df_socios_qsa.copy()
+    df_tmp["data"] = pd.to_datetime(df_tmp["data"], errors="coerce")
+    data_ref = df_tmp["data"].max()
+    if pd.isna(data_ref):
+        return pd.DataFrame()
 
-    part = data_ref.replace("-", "")
-    tabela_socios = f"`basedosdados.br_me_cnpj.socios${part}`"
-    tabela_empresas = f"`basedosdados.br_me_cnpj.empresas${part}`"
+    data_ref_str = data_ref.strftime("%Y-%m-%d")
 
-    sql = f"""
+    sql = """
     WITH nomes_socios AS (
         SELECT DISTINCT nome
         FROM UNNEST(@lista_nomes) AS nome
+    ),
+    socios_filtrados AS (
+        SELECT *
+        FROM `basedosdados.br_me_cnpj.socios`
+        WHERE _PARTITIONDATE = @data_ref
     ),
     socios_vinc AS (
         SELECT
@@ -437,7 +440,7 @@ def consultar_empresas_vinculadas_por_nome(
             s.documento,
             s.qualificacao,
             s.data_entrada_sociedade
-        FROM {tabela_socios} AS s
+        FROM socios_filtrados AS s
         JOIN nomes_socios n
             ON s.nome = n.nome
     ),
@@ -445,6 +448,11 @@ def consultar_empresas_vinculadas_por_nome(
         SELECT DISTINCT cnpj_basico
         FROM socios_vinc
         WHERE cnpj_basico IS NOT NULL
+    ),
+    empresas_filtradas AS (
+        SELECT *
+        FROM `basedosdados.br_me_cnpj.empresas`
+        WHERE _PARTITIONDATE = @data_ref
     ),
     empresas_completa AS (
         SELECT
@@ -456,7 +464,7 @@ def consultar_empresas_vinculadas_por_nome(
             e.natureza_juridica,
             nj.descricao AS natureza_juridica_descricao,
             e.capital_social
-        FROM {tabela_empresas} AS e
+        FROM empresas_filtradas AS e
         JOIN cnpjs_socios c
             ON e.cnpj_basico = c.cnpj_basico
         LEFT JOIN `basedosdados.br_bd_diretorios_brasil.natureza_juridica` nj
@@ -491,6 +499,7 @@ def consultar_empresas_vinculadas_por_nome(
         query_parameters=[
             bigquery.ArrayQueryParameter("lista_nomes", "STRING", nomes_socios),
             bigquery.ScalarQueryParameter("cnpj_foco", "STRING", cnpj_basico_foco),
+            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref_str),
         ],
         maximum_bytes_billed=MAX_BYTES_EMP_VINC,
     )
@@ -504,30 +513,33 @@ def consultar_empresas_vinculadas_por_nome(
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
-def cached_consultar_empresa_foco(cnpj_basico: str, data_ref: str) -> pd.DataFrame:
+def cached_consultar_empresa_foco(cnpj_basico: str) -> pd.DataFrame:
     """Wrapper cacheado para empresa foco (sem log dentro)."""
     client = get_bq_client()
+    data_ref = get_data_ref_for_cnpj(cnpj_basico)
+    if not data_ref:
+        # Deixa vazio; a camada de UI mostra mensagem amigável
+        return pd.DataFrame()
     return consultar_empresa_foco(client, cnpj_basico, data_ref)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
-def cached_consultar_socios_foco(cnpj_basico: str, data_ref: str) -> pd.DataFrame:
+def cached_consultar_socios_foco(cnpj_basico: str) -> pd.DataFrame:
     """Wrapper cacheado para sócios da empresa foco (sem log dentro)."""
     client = get_bq_client()
+    data_ref = get_data_ref_for_cnpj(cnpj_basico)
+    if not data_ref:
+        return pd.DataFrame()
     return consultar_socios_foco(client, cnpj_basico, data_ref)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def cached_consultar_empresas_vinculadas_por_nome(
-    df_socios_qsa: pd.DataFrame,
-    cnpj_basico_foco: str,
-    data_ref: str,
+    df_socios_qsa: pd.DataFrame, cnpj_basico_foco: str
 ) -> pd.DataFrame:
     """Wrapper cacheado para empresas vinculadas (sem log dentro)."""
     client = get_bq_client()
-    return consultar_empresas_vinculadas_por_nome(
-        client, df_socios_qsa, cnpj_basico_foco, data_ref
-    )
+    return consultar_empresas_vinculadas_por_nome(client, df_socios_qsa, cnpj_basico_foco)
 
 
 # ============================================================
@@ -935,8 +947,8 @@ if run_btn:
         client = get_bq_client()
         log(f"BigQuery conectado no projeto: {client.project}")
 
-        # --- DATA_REF (dia 10 → 1, mês atual + anterior) ---
-        set_progress(15, "Descobrindo snapshot (dias 10 → 1, mês atual + anterior)...")
+        # --- EMPRESA FOCO ---
+        set_progress(15, "Descobrindo snapshot (dias 10–1, mês atual + anterior)...")
         data_ref = get_data_ref_for_cnpj(cnpj_basico)
 
         if not data_ref:
@@ -949,25 +961,24 @@ if run_btn:
 
         log(f"Usando snapshot {data_ref} para todas as consultas.")
 
-        # --- EMPRESA FOCO (cacheado) ---
         set_progress(25, "Consultando empresa foco...")
-        df_empresa_foco = cached_consultar_empresa_foco(cnpj_basico, data_ref)
+        df_empresa_foco = consultar_empresa_foco(client, cnpj_basico, data_ref)
         if df_empresa_foco.empty:
             st.error("Empresa foco não encontrada para esse CNPJ no snapshot escolhido.")
             progress.empty()
             st.stop()
 
-        # --- SÓCIOS EMPRESA FOCO (cacheado) ---
+        # --- SÓCIOS EMPRESA FOCO ---
         set_progress(40, "Consultando sócios da empresa foco...")
-        df_socios_foco = cached_consultar_socios_foco(cnpj_basico, data_ref)
+        df_socios_foco = consultar_socios_foco(client, cnpj_basico, data_ref)
 
         set_progress(55, "Selecionando QSA mais recente...")
         df_socios_qsa = selecionar_qsa_atual(df_socios_foco)
 
-        # --- EMPRESAS VINCULADAS (cacheado, mesmo snapshot) ---
+        # --- EMPRESAS VINCULADAS ---
         set_progress(70, "Consultando empresas vinculadas...")
         df_empresas_vinc = cached_consultar_empresas_vinculadas_por_nome(
-            df_socios_qsa, cnpj_basico, data_ref
+            df_socios_qsa, cnpj_basico
         )
         log(f"Empresas vinculadas consultadas (deduplicadas): {len(df_empresas_vinc)} linhas.")
 
