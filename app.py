@@ -66,11 +66,11 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # ============================================================
 
 # Limites de bytes processados por query (em bytes)
-# Mantemos folga de até ~10 GiB por query, mas o uso real deve ficar
-# bem abaixo disso por conta dos filtros de partição por data.
-MAX_BYTES_EMPRESA_FOCO = 12 * 1024**3
-MAX_BYTES_SOCIOS_FOCO  = 12 * 1024**3
-MAX_BYTES_EMP_VINC     = 12 * 1024**3
+# Foco (empresa/sócios) é leve; vinculadas é a query pesada.
+MAX_BYTES_EMPRESA_FOCO = 4 * 1024**3        # ~4 GiB
+MAX_BYTES_SOCIOS_FOCO  = 4 * 1024**3        # ~4 GiB
+# Vinculadas precisa de ~11.9 GiB na prática, então deixamos folga de 12 GiB
+MAX_BYTES_EMP_VINC     = 12 * 1024**3       # ~12 GiB
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -101,6 +101,40 @@ def get_bq_client():
 
 
 # ============================================================
+# PARTIÇÕES MAIS RECENTES (EMPRESAS / SÓCIOS)
+# ============================================================
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+def get_partition_dates(table_name: str, max_dates: int = 2) -> list[str]:
+    """
+    Retorna as datas de partição mais recentes para a tabela informada
+    (ex.: 'empresas' ou 'socios'), em formato 'YYYY-MM-DD'.
+
+    Usamos INFORMATION_SCHEMA.PARTITIONS (custo praticamente zero).
+    max_dates=2 implementa "mês mais recente + fallback pro anterior".
+    """
+    client = get_bq_client()
+    sql = f"""
+    SELECT
+      SAFE.PARSE_DATE('%Y%m%d', partition_id) AS data_ref
+    FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+    WHERE table_name = '{table_name}'
+      AND partition_id IS NOT NULL
+      AND partition_id != '__UNPARTITIONED__'
+    ORDER BY data_ref DESC
+    LIMIT {max_dates}
+    """
+    df = client.query(sql).to_dataframe()
+
+    datas = []
+    for _, row in df.iterrows():
+        if row["data_ref"] is not None:
+            datas.append(row["data_ref"].isoformat())
+
+    return datas
+
+
+# ============================================================
 # HELPERS DE CNPJ
 # ============================================================
 
@@ -124,12 +158,15 @@ def extrair_cnpj_basico(cnpj_14: str) -> str:
 def consultar_empresa_foco(
     client: bigquery.Client,
     cnpj_basico: str,
+    data_ref: str,
 ) -> pd.DataFrame:
     """
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
-    usando apenas os últimos ~60 dias de dados (1–2 snapshots mensais),
-    para evitar varrer o histórico inteiro.
+    usando APENAS o snapshot da data_ref (partição por data).
     """
+    if not data_ref:
+        raise ValueError("Data de referência para 'empresas' não encontrada.")
+
     sql = """
     WITH 
     dicionario_qualificacao_responsavel AS (
@@ -172,16 +209,16 @@ def consultar_empresa_foco(
         ON dados.qualificacao_responsavel = chave_qualificacao_responsavel
     LEFT JOIN dicionario_porte
         ON dados.porte = chave_porte
-    WHERE dados.cnpj_basico = @cnpj_basico
-      AND dados.data >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
-    QUALIFY ROW_NUMBER()
-           OVER (PARTITION BY dados.data
-                 ORDER BY dados.data DESC) = 1
+    WHERE dados.data = @data_ref          -- filtro direto na partição
+      AND dados.cnpj_basico = @cnpj_basico
+    ORDER BY ano DESC, mes DESC, data DESC
+    LIMIT 1
     """
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
+            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref),
         ],
         maximum_bytes_billed=MAX_BYTES_EMPRESA_FOCO,
     )
@@ -192,12 +229,16 @@ def consultar_empresa_foco(
 def consultar_socios_foco(
     client: bigquery.Client,
     cnpj_basico: str,
+    data_ref: str,
 ) -> pd.DataFrame:
     """
     Consulta todos os sócios da empresa foco em br_me_cnpj.socios,
-    considerando apenas os últimos ~60 dias (1–2 snapshots).
-    O filtro fino para o QSA atual continua sendo feito em selecionar_qsa_atual.
+    SOMENTE no snapshot indicado por data_ref (partição por data),
+    limitada por MAX_BYTES_SOCIOS_FOCO.
     """
+    if not data_ref:
+        raise ValueError("Data de referência para 'socios' não encontrada.")
+
     sql = """
     WITH 
     dicionario_tipo AS (
@@ -271,13 +312,14 @@ def consultar_socios_foco(
         ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
     LEFT JOIN dicionario_faixa_etaria
         ON dados.faixa_etaria = chave_faixa_etaria
-    WHERE dados.cnpj_basico = @cnpj_basico
-      AND dados.data >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+    WHERE dados.data = @data_ref          -- filtro direto na partição
+      AND dados.cnpj_basico = @cnpj_basico
     """
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
+            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref),
         ],
         maximum_bytes_billed=MAX_BYTES_SOCIOS_FOCO,
     )
@@ -417,16 +459,41 @@ def consultar_empresas_vinculadas_por_nome(
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def cached_consultar_empresa_foco(cnpj_basico: str) -> pd.DataFrame:
-    """Wrapper cacheado para empresa foco (sem log dentro)."""
+    """
+    Wrapper cacheado para empresa foco.
+
+    Tenta a última partição de 'empresas'; se não encontrar a empresa,
+    tenta a partição imediatamente anterior.
+    """
     client = get_bq_client()
-    return consultar_empresa_foco(client, cnpj_basico)
+    datas = get_partition_dates("empresas", max_dates=2)
+
+    for data_ref in datas:
+        df = consultar_empresa_foco(client, cnpj_basico, data_ref)
+        if not df.empty:
+            return df
+
+    # não encontrou em nenhuma partição recente
+    return pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def cached_consultar_socios_foco(cnpj_basico: str) -> pd.DataFrame:
-    """Wrapper cacheado para sócios da empresa foco (sem log dentro)."""
+    """
+    Wrapper cacheado para sócios da empresa foco.
+
+    Tenta a última partição de 'socios'; se não encontrar nada,
+    tenta a partição imediatamente anterior.
+    """
     client = get_bq_client()
-    return consultar_socios_foco(client, cnpj_basico)
+    datas = get_partition_dates("socios", max_dates=2)
+
+    for data_ref in datas:
+        df = consultar_socios_foco(client, cnpj_basico, data_ref)
+        if not df.empty:
+            return df
+
+    return pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
@@ -688,7 +755,7 @@ def build_cytoscape_elements(G: nx.Graph, pos, selected_ids):
 
 
 def get_stylesheet():
-    """Estilo com highlight."""
+    """Estilo com highlight igual à célula 7."""
     return [
         # base
         {
@@ -844,22 +911,22 @@ if run_btn:
         log(f"BigQuery conectado no projeto: {client.project}")
 
         # --- EMPRESA FOCO (cacheado) ---
-        set_progress(15, "Consultando empresa foco (últimos ~60 dias)...")
+        set_progress(15, "Consultando empresa foco...")
         df_empresa_foco = cached_consultar_empresa_foco(cnpj_basico)
         if df_empresa_foco.empty:
-            st.error("Empresa foco não encontrada para esse CNPJ nos últimos 60 dias.")
+            st.error("Empresa foco não encontrada para esse CNPJ.")
             progress.empty()
             st.stop()
 
         # --- SÓCIOS EMPRESA FOCO (cacheado) ---
-        set_progress(30, "Consultando sócios da empresa foco (últimos ~60 dias)...")
+        set_progress(30, "Consultando sócios da empresa foco...")
         df_socios_foco = cached_consultar_socios_foco(cnpj_basico)
 
         set_progress(45, "Selecionando QSA mais recente...")
         df_socios_qsa = selecionar_qsa_atual(df_socios_foco)
 
         # --- EMPRESAS VINCULADAS (cacheado, otimizado) ---
-        set_progress(60, "Consultando empresas vinculadas (snapshot do QSA atual)...")
+        set_progress(60, "Consultando empresas vinculadas...")
         df_empresas_vinc = cached_consultar_empresas_vinculadas_por_nome(
             df_socios_qsa, cnpj_basico
         )
@@ -1060,5 +1127,3 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
-
-
