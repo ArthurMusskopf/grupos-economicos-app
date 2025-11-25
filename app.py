@@ -175,7 +175,7 @@ def consultar_empresa_foco(
     WHERE dados.cnpj_basico = @cnpj_basico
       AND dados.data >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
     QUALIFY ROW_NUMBER()
-           OVER (PARTITION BY dados.cnpj_basico
+           OVER (PARTITION BY dados.data
                  ORDER BY dados.data DESC) = 1
     """
 
@@ -1060,4 +1060,5 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
