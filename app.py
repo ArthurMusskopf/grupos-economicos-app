@@ -125,7 +125,7 @@ def _gerar_datas_candidatas(max_meses_retrocesso: int = 2):
             ano_atual -= 1
 
         _, dias_no_mes = calendar.monthrange(ano_atual, mes_atual)
-        ultimo_dia = min(10, dias_no_mes)
+        ultimo_dia = min(30, dias_no_mes)
 
         for dia in range(ultimo_dia, 0, -1):  # 10, 9, ..., 1
             yield date(ano_atual, mes_atual, dia)
@@ -135,7 +135,7 @@ def _gerar_datas_candidatas(max_meses_retrocesso: int = 2):
 def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
     """
     Descobre a última data de snapshot para o CNPJ na tabela de SÓCIOS,
-    procurando do dia 10 até o dia 1 do mês atual e do mês anterior,
+    procurando do dia 30 até o dia 1 do mês atual e do mês anterior,
     usando partição DIÁRIA via decorator: socios$YYYYMMDD.
 
     Retorna 'YYYY-MM-DD' ou None.
@@ -171,7 +171,7 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
 
     log(
         f"Nenhum snapshot encontrado para {cnpj_basico} "
-        f"entre os dias 1 e 10 do mês atual e anterior."
+        f"entre os dias 1 e 30 do mês atual e anterior."
     )
     return None
 
@@ -1169,5 +1169,6 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
