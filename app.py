@@ -2,7 +2,7 @@ import re
 import math
 import time
 from datetime import datetime, date
-import calendar
+import calendar  # pode ficar, mesmo não sendo essencial agora
 
 import streamlit as st
 import pandas as pd
@@ -67,13 +67,15 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # ============================================================
 
 # Limites de bytes processados por query (em bytes)
-# Agora considerando 1 dia de partição (~0,1–0,2 GiB) com boa folga
-MAX_BYTES_EMPRESA_FOCO = 2 * 1024**3       # ~2 GiB
-MAX_BYTES_SOCIOS_FOCO  = 2 * 1024**3       # ~2 GiB
-MAX_BYTES_EMP_VINC     = 5 * 1024**3       # ~5 GiB (join mais pesado)
+# Ajustados com base nos ~5–6 GiB por partição que você mostrou
+MAX_BYTES_EMPRESA_FOCO = 4 * 1024**3       # ~4 GiB
+MAX_BYTES_SOCIOS_FOCO  = 4 * 1024**3       # ~4 GiB
+# Join pesado (socios + empresas inteiras em 1 snapshot)
+MAX_BYTES_EMP_VINC     = 12 * 1024**3      # ~12 GiB
 
 # Limite para as queries de detecção de snapshot por CNPJ
-MAX_BYTES_DETECCAO     = 1 * 1024**3       # ~1 GiB por tentativa
+# (SELECT 1 filtrando só data + cnpj_basico → mais barato que o total da partição)
+MAX_BYTES_DETECCAO     = 3 * 1024**3       # ~3 GiB
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -104,50 +106,62 @@ def get_bq_client():
 
 
 # ============================================================
-# DESCOBRIR DATA_REF POR CNPJ (DIA 10 → 1, MÊS ATUAL + ANTERIOR)
+# DESCOBRIR DATA_REF POR CNPJ (USANDO PARTIÇÕES REAIS)
 # ============================================================
 
-def _gerar_datas_candidatas(max_meses_retrocesso: int = 2):
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+def get_empresas_partitions():
     """
-    Gera datas da forma:
-    - mês atual: dia 10 até o dia 1 (decrescente)
-    - mês anterior: dia 10 até o dia 1 (decrescente)
+    Lê as partições reais da tabela br_me_cnpj.empresas a partir do
+    INFORMATION_SCHEMA.PARTITIONS.
+
+    Isso é metadado (quase de graça).
+    Retorna uma lista de datas de snapshot, ordenadas da mais recente para a mais antiga.
     """
-    hoje = datetime.utcnow().date()
-    ano = hoje.year
-    mes = hoje.month
-
-    for offset_mes in range(max_meses_retrocesso):
-        ano_atual = ano
-        mes_atual = mes - offset_mes
-        while mes_atual <= 0:
-            mes_atual += 12
-            ano_atual -= 1
-
-        _, dias_no_mes = calendar.monthrange(ano_atual, mes_atual)
-        ultimo_dia = min(10, dias_no_mes)
-
-        for dia in range(ultimo_dia, 0, -1):  # 10, 9, ..., 1
-            yield date(ano_atual, mes_atual, dia)
+    client = get_bq_client()
+    sql = """
+    SELECT
+      SAFE.PARSE_DATE('%Y%m%d', partition_id) AS data_ref
+    FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+    WHERE table_name = 'empresas'
+      AND partition_id IS NOT NULL
+    """
+    df = client.query(sql).to_dataframe()
+    df = df.dropna(subset=["data_ref"])
+    df["data_ref"] = pd.to_datetime(df["data_ref"]).dt.date
+    datas = sorted(df["data_ref"].unique(), reverse=True)
+    return datas
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=200)
 def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
     """
-    Descobre a última data de snapshot para o CNPJ na tabela de EMPRESAS,
-    procurando do dia 10 até o dia 1 do mês atual e do mês anterior,
-    usando partição DIÁRIA via coluna _PARTITIONDATE.
+    Procura, entre as partições reais da tabela 'empresas',
+    o snapshot mais recente em que o CNPJ básico existe.
 
-    Retorna 'YYYY-MM-DD' ou None.
+    Não chuta dia 1–10. Usa exatamente as datas de partition_id.
     """
     client = get_bq_client()
-    log(f"Descobrindo snapshot (dias 10 → 1, mês atual + anterior) para {cnpj_basico}...")
+    datas_particoes = get_empresas_partitions()
 
-    for d in _gerar_datas_candidatas(max_meses_retrocesso=2):
+    # opcional: limitar a busca aos últimos N snapshots (por exemplo 6)
+    MAX_SNAPSHOTS = 6
+    datas_candidatas = datas_particoes[:MAX_SNAPSHOTS]
+
+    if not datas_candidatas:
+        log("Nenhuma partição encontrada em INFORMATION_SCHEMA.PARTITIONS.")
+        return None
+
+    log(
+        "Datas de snapshot candidatas para "
+        f"{cnpj_basico}: {', '.join(d.isoformat() for d in datas_candidatas)}"
+    )
+
+    for d in datas_candidatas:
         sql = """
         SELECT 1
         FROM `basedosdados.br_me_cnpj.empresas`
-        WHERE _PARTITIONDATE = @data_ref
+        WHERE data = @data_ref
           AND cnpj_basico = @cnpj_basico
         LIMIT 1
         """
@@ -162,7 +176,7 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
         try:
             df = client.query(sql, job_config=job_config).to_dataframe()
         except Exception as e:
-            # Se der erro pontual na partição, só registra e continua
+            # se der erro de bytes ou qualquer outra coisa, registra e tenta a próxima
             log(f"Falha ao checar snapshot {d.isoformat()} para {cnpj_basico}: {e}")
             continue
 
@@ -172,8 +186,8 @@ def get_data_ref_for_cnpj(cnpj_basico: str) -> str | None:
             return data_ref
 
     log(
-        f"Nenhum snapshot encontrado para {cnpj_basico} "
-        f"entre os dias 10 e 1 do mês atual e do anterior."
+        f"Nenhum snapshot com esse CNPJ encontrado nos "
+        f"{len(datas_candidatas)} snapshots mais recentes de 'empresas'."
     )
     return None
 
@@ -206,7 +220,7 @@ def consultar_empresa_foco(
 ) -> pd.DataFrame:
     """
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
-    usando APENAS o snapshot de data_ref (partição diária via _PARTITIONDATE).
+    usando APENAS o snapshot de data_ref (filtro por data).
     """
     if not data_ref:
         raise ValueError("Data de referência para 'empresas' não informada.")
@@ -253,7 +267,7 @@ def consultar_empresa_foco(
         ON dados.qualificacao_responsavel = chave_qualificacao_responsavel
     LEFT JOIN dicionario_porte
         ON dados.porte = chave_porte
-    WHERE _PARTITIONDATE = @data_ref
+    WHERE dados.data = @data_ref
       AND dados.cnpj_basico = @cnpj_basico
     ORDER BY ano DESC, mes DESC, data DESC
     LIMIT 1
@@ -277,7 +291,7 @@ def consultar_socios_foco(
 ) -> pd.DataFrame:
     """
     Consulta todos os sócios da empresa foco em br_me_cnpj.socios,
-    SOMENTE no snapshot indicado por data_ref (partição diária via _PARTITIONDATE),
+    SOMENTE no snapshot indicado por data_ref (filtro por data),
     limitada por MAX_BYTES_SOCIOS_FOCO.
     """
     if not data_ref:
@@ -356,7 +370,7 @@ def consultar_socios_foco(
         ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
     LEFT JOIN dicionario_faixa_etaria
         ON dados.faixa_etaria = chave_faixa_etaria
-    WHERE _PARTITIONDATE = @data_ref
+    WHERE dados.data = @data_ref
       AND dados.cnpj_basico = @cnpj_basico
     """
 
@@ -425,11 +439,6 @@ def consultar_empresas_vinculadas_por_nome(
         SELECT DISTINCT nome
         FROM UNNEST(@lista_nomes) AS nome
     ),
-    socios_filtrados AS (
-        SELECT *
-        FROM `basedosdados.br_me_cnpj.socios`
-        WHERE _PARTITIONDATE = @data_ref
-    ),
     socios_vinc AS (
         SELECT
             s.ano,
@@ -440,19 +449,15 @@ def consultar_empresas_vinculadas_por_nome(
             s.documento,
             s.qualificacao,
             s.data_entrada_sociedade
-        FROM socios_filtrados AS s
+        FROM `basedosdados.br_me_cnpj.socios` AS s
         JOIN nomes_socios n
             ON s.nome = n.nome
+        WHERE s.data = @data_ref
     ),
     cnpjs_socios AS (
         SELECT DISTINCT cnpj_basico
         FROM socios_vinc
         WHERE cnpj_basico IS NOT NULL
-    ),
-    empresas_filtradas AS (
-        SELECT *
-        FROM `basedosdados.br_me_cnpj.empresas`
-        WHERE _PARTITIONDATE = @data_ref
     ),
     empresas_completa AS (
         SELECT
@@ -464,11 +469,12 @@ def consultar_empresas_vinculadas_por_nome(
             e.natureza_juridica,
             nj.descricao AS natureza_juridica_descricao,
             e.capital_social
-        FROM empresas_filtradas AS e
+        FROM `basedosdados.br_me_cnpj.empresas` AS e
         JOIN cnpjs_socios c
             ON e.cnpj_basico = c.cnpj_basico
         LEFT JOIN `basedosdados.br_bd_diretorios_brasil.natureza_juridica` nj
             ON e.natureza_juridica = nj.id_natureza_juridica
+        WHERE e.data = @data_ref
     ),
     joined AS (
         SELECT
@@ -947,20 +953,21 @@ if run_btn:
         client = get_bq_client()
         log(f"BigQuery conectado no projeto: {client.project}")
 
-        # --- EMPRESA FOCO ---
-        set_progress(15, "Descobrindo snapshot (dias 10–1, mês atual + anterior)...")
+        # --- DATA_REF PARA ESTE CNPJ ---
+        set_progress(15, "Descobrindo snapshot mais recente com esse CNPJ (via PARTITIONS)...")
         data_ref = get_data_ref_for_cnpj(cnpj_basico)
 
         if not data_ref:
             st.error(
-                "Empresa foco não encontrada nas janelas de snapshot "
-                "(dias 10 a 1 do mês atual e do anterior)."
+                "Empresa foco não encontrada em nenhum dos snapshots recentes "
+                "da tabela 'empresas'."
             )
             progress.empty()
             st.stop()
 
-        log(f"Usando snapshot {data_ref} para todas as consultas.")
+        log(f"Usando snapshot {data_ref} para empresa foco e sócios.")
 
+        # --- EMPRESA FOCO ---
         set_progress(25, "Consultando empresa foco...")
         df_empresa_foco = consultar_empresa_foco(client, cnpj_basico, data_ref)
         if df_empresa_foco.empty:
