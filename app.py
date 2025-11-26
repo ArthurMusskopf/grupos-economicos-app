@@ -70,8 +70,8 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # Agora considerando 1 snapshot (~5–6 GiB) com folga
 MAX_BYTES_EMPRESA_FOCO = 8 * 1024**3       # ~8 GiB
 MAX_BYTES_SOCIOS_FOCO  = 8 * 1024**3       # ~8 GiB
-MAX_BYTES_EMP_VINC     = 14 * 1024**3      # ~14 GiB (join mais pesado)
-MAX_BYTES_DATA_REF     = 6 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
+MAX_BYTES_EMP_VINC     = 8 * 1024**3      # ~14 GiB (join mais pesado)
+MAX_BYTES_DATA_REF     = 30 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -1149,6 +1149,7 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
 
