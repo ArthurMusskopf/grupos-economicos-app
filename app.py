@@ -108,7 +108,7 @@ def get_bq_client():
 # SNAPSHOT MAIS RECENTE (PARTIÇÕES) - EMPRESAS / SÓCIOS
 # ============================================================
 
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+@@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
 def get_latest_snapshots() -> dict:
     """
     Retorna as últimas datas disponíveis na coluna `data` das tabelas
@@ -1187,6 +1187,7 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
 
