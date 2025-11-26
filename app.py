@@ -70,8 +70,11 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # Agora considerando 1 snapshot (~5–6 GiB) com folga
 MAX_BYTES_EMPRESA_FOCO = 8 * 1024**3       # ~8 GiB
 MAX_BYTES_SOCIOS_FOCO  = 8 * 1024**3       # ~8 GiB
-MAX_BYTES_EMP_VINC     = 8 * 1024**3      # ~14 GiB (join mais pesado)
-MAX_BYTES_DATA_REF     = 30 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
+MAX_BYTES_EMP_VINC     = 14 * 1024**3      # ~14 GiB (join mais pesado)
+MAX_BYTES_DATA_REF     = 6 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
+
+# Quantidade de partições de ingestão a inspecionar ao buscar o snapshot mais recente
+PARTICOES_RECENTES = 4
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -108,28 +111,76 @@ def get_bq_client():
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL)
 def get_latest_snapshots() -> dict:
     """
-    Retorna as últimas datas de snapshot (partição) para
-    as tabelas 'empresas' e 'socios' do br_me_cnpj.
+    Retorna as últimas datas disponíveis na coluna `data` das tabelas
+    'empresas' e 'socios' do br_me_cnpj.
 
-    Usa INFORMATION_SCHEMA.PARTITIONS (custo praticamente zero)
-    e converte partition_id (YYYYMMDD) em 'YYYY-MM-DD'.
+    Observação:
+    - A tabela é particionada por tempo de ingestão (partition_id), que não
+      necessariamente coincide com o campo `data` (data de referência do
+      snapshot).
+    - Para evitar escanear toda a tabela, primeiro capturamos as últimas
+      partições de ingestão em INFORMATION_SCHEMA.PARTITIONS e calculamos o
+      MAX(data) apenas nelas.
     """
     client = get_bq_client()
-    sql = """
-    SELECT
-      table_name,
-      MAX(SAFE.PARSE_DATE('%Y%m%d', partition_id)) AS data_ref
-    FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
-    WHERE table_name IN ('empresas', 'socios')
-      AND partition_id IS NOT NULL
-      AND partition_id != '__UNPARTITIONED__'
-    GROUP BY table_name
+    sql = f"""
+    WITH last_parts_empresas AS (
+        SELECT DATE(PARSE_DATE('%Y%m%d', partition_id)) AS part
+        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'empresas'
+          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+        QUALIFY ROW_NUMBER() OVER (ORDER BY partition_id DESC) <= @particoes_recentes
+    ),
+    last_parts_socios AS (
+        SELECT DATE(PARSE_DATE('%Y%m%d', partition_id)) AS part
+        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'socios'
+          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+        QUALIFY ROW_NUMBER() OVER (ORDER BY partition_id DESC) <= @particoes_recentes
+    ),
+    latest_partitions AS (
+        SELECT 'empresas' AS table_name,
+               ARRAY_AGG(part ORDER BY part DESC) AS parts
+        FROM last_parts_empresas
+
+        UNION ALL
+
+        SELECT 'socios' AS table_name,
+               ARRAY_AGG(part ORDER BY part DESC) AS parts
+        FROM last_parts_socios
+    ),
+    max_data AS (
+        SELECT 'empresas' AS table_name, MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.empresas`
+        WHERE DATE(_PARTITIONTIME) IN (
+            SELECT DISTINCT part FROM latest_partitions, UNNEST(parts) AS part
+            WHERE table_name = 'empresas'
+        )
+        UNION ALL
+        SELECT 'socios' AS table_name, MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.socios`
+        WHERE DATE(_PARTITIONTIME) IN (
+            SELECT DISTINCT part FROM latest_partitions, UNNEST(parts) AS part
+            WHERE table_name = 'socios'
+        )
+    )
+    SELECT table_name, data_ref
+    FROM max_data
     """
-    df = client.query(sql).to_dataframe()
+
+    job_config = bigquery.QueryJobConfig(
+        maximum_bytes_billed=MAX_BYTES_DATA_REF,
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "particoes_recentes", "INT64", PARTICOES_RECENTES
+            )
+        ],
+    )
+    df = client.query(sql, job_config=job_config).to_dataframe()
 
     result: dict[str, str] = {}
     for _, row in df.iterrows():
-        if row["data_ref"] is not None:
+        if pd.notna(row["data_ref"]):
             result[row["table_name"]] = row["data_ref"].isoformat()
 
     return result
@@ -1136,19 +1187,3 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
