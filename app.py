@@ -71,8 +71,10 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 MAX_BYTES_EMPRESA_FOCO = 8 * 1024**3       # ~8 GiB
 MAX_BYTES_SOCIOS_FOCO  = 8 * 1024**3       # ~8 GiB
 MAX_BYTES_EMP_VINC     = 14 * 1024**3      # ~14 GiB (join mais pesado)
-MAX_BYTES_DATA_REF     = 30 * 1024**3      # ~10 GiB (descobrir snapshot mais recente)
+MAX_BYTES_DATA_REF     = 6 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
 
+# Quantidade de partições de ingestão a inspecionar ao buscar o snapshot mais recente
+PARTICOES_RECENTES = 4
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
 
@@ -114,19 +116,59 @@ def get_latest_snapshots() -> dict:
     Observação:
     - A tabela é particionada por tempo de ingestão (partition_id), que não
       necessariamente coincide com o campo `data` (data de referência do
-      snapshot). Por isso, a busca usa `MAX(data)` na própria tabela em vez de
-      INFORMATION_SCHEMA.PARTITIONS.
+      snapshot).
+    - Para evitar escanear toda a tabela, primeiro capturamos as últimas
+      partições de ingestão em INFORMATION_SCHEMA.PARTITIONS e calculamos o
+      MAX(data) apenas nelas.
     """
     client = get_bq_client()
-    sql = """
-    SELECT 'empresas' AS table_name, MAX(data) AS data_ref
-    FROM `basedosdados.br_me_cnpj.empresas`
-    UNION ALL
-    SELECT 'socios' AS table_name, MAX(data) AS data_ref
-    FROM `basedosdados.br_me_cnpj.socios`
+    sql = f"""
+    DECLARE n_partitions INT64 DEFAULT @particoes_recentes;
+
+    WITH latest_partitions AS (
+        SELECT 'empresas' AS table_name,
+               ARRAY_AGG(DATE(PARSE_DATE('%Y%m%d', partition_id))
+                        ORDER BY partition_id DESC LIMIT n_partitions) AS parts
+        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'empresas'
+          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+
+        UNION ALL
+
+        SELECT 'socios' AS table_name,
+               ARRAY_AGG(DATE(PARSE_DATE('%Y%m%d', partition_id))
+                        ORDER BY partition_id DESC LIMIT n_partitions) AS parts
+        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'socios'
+          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+    ),
+    max_data AS (
+        SELECT 'empresas' AS table_name, MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.empresas`
+        WHERE _PARTITIONDATE IN (
+            SELECT DISTINCT part FROM latest_partitions, UNNEST(parts) AS part
+            WHERE table_name = 'empresas'
+        )
+        UNION ALL
+        SELECT 'socios' AS table_name, MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.socios`
+        WHERE _PARTITIONDATE IN (
+            SELECT DISTINCT part FROM latest_partitions, UNNEST(parts) AS part
+            WHERE table_name = 'socios'
+        )
+    )
+    SELECT table_name, data_ref
+    FROM max_data
     """
 
-    job_config = bigquery.QueryJobConfig(maximum_bytes_billed=MAX_BYTES_DATA_REF)
+    job_config = bigquery.QueryJobConfig(
+        maximum_bytes_billed=MAX_BYTES_DATA_REF,
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "particoes_recentes", "INT64", PARTICOES_RECENTES
+            )
+        ],
+    )
     df = client.query(sql, job_config=job_config).to_dataframe()
 
     result: dict[str, str] = {}
@@ -1138,6 +1180,7 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
 
