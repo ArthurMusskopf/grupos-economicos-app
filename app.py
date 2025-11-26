@@ -157,8 +157,8 @@ def extrair_cnpj_basico(cnpj_14: str) -> str:
 
 def consultar_empresa_foco(
     client: bigquery.Client,
-    cnpj_basico: '54651716',
-    data_ref: '2025-11-09',
+    cnpj_basico: "54651716",
+    data_ref: "2025-11-10",
 ) -> pd.DataFrame:
     """
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
@@ -1136,4 +1136,5 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
