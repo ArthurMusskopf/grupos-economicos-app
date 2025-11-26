@@ -1,7 +1,7 @@
 import re
 import math
 import time
-from datetime import datetime, date
+from datetime import datetime
 import calendar
 
 import streamlit as st
@@ -163,12 +163,19 @@ def consultar_empresa_foco(
     """
     Consulta a linha mais recente da empresa foco em br_me_cnpj.empresas,
     usando APENAS o snapshot de data_ref (partição por data),
-    filtrando por dados.data = @data_ref para ativar pruning de partição.
+    com filtro literal em data e cnpj_basico (sem parâmetro de DATE).
     """
     if not data_ref:
         raise ValueError("Data de referência para 'empresas' não informada.")
 
-    sql = """
+    # Segurança básica: forçar só dígitos no CNPJ e formato de data AAAA-MM-DD
+    cnpj_basico = re.sub(r"\D", "", cnpj_basico or "")
+    if not re.fullmatch(r"\d{8}", cnpj_basico):
+        raise ValueError("cnpj_basico inválido para consulta.")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_ref):
+        raise ValueError("data_ref inválida para consulta.")
+
+    sql = f"""
     WITH 
     dicionario_qualificacao_responsavel AS (
         SELECT
@@ -210,17 +217,13 @@ def consultar_empresa_foco(
         ON dados.qualificacao_responsavel = chave_qualificacao_responsavel
     LEFT JOIN dicionario_porte
         ON dados.porte = chave_porte
-    WHERE dados.data = @data_ref
-      AND dados.cnpj_basico = @cnpj_basico
+    WHERE dados.data = '{data_ref}'
+      AND dados.cnpj_basico = '{cnpj_basico}'
     ORDER BY ano DESC, mes DESC, data DESC
     LIMIT 1
     """
 
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref),
-            bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
-        ],
         maximum_bytes_billed=MAX_BYTES_EMPRESA_FOCO,
     )
     df = client.query(sql, job_config=job_config).to_dataframe()
@@ -235,12 +238,18 @@ def consultar_socios_foco(
     """
     Consulta todos os sócios da empresa foco em br_me_cnpj.socios,
     SOMENTE no snapshot indicado por data_ref (partição por data),
-    limitada por MAX_BYTES_SOCIOS_FOCO.
+    com filtro literal em data e cnpj_basico.
     """
     if not data_ref:
         raise ValueError("Data de referência para 'socios' não informada.")
 
-    sql = """
+    cnpj_basico = re.sub(r"\D", "", cnpj_basico or "")
+    if not re.fullmatch(r"\d{8}", cnpj_basico):
+        raise ValueError("cnpj_basico inválido para consulta.")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_ref):
+        raise ValueError("data_ref inválida para consulta.")
+
+    sql = f"""
     WITH 
     dicionario_tipo AS (
         SELECT
@@ -313,15 +322,11 @@ def consultar_socios_foco(
         ON dados.qualificacao_representante_legal = chave_qualificacao_representante_legal
     LEFT JOIN dicionario_faixa_etaria
         ON dados.faixa_etaria = chave_faixa_etaria
-    WHERE dados.data = @data_ref
-      AND dados.cnpj_basico = @cnpj_basico
+    WHERE dados.data = '{data_ref}'
+      AND dados.cnpj_basico = '{cnpj_basico}'
     """
 
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref),
-            bigquery.ScalarQueryParameter("cnpj_basico", "STRING", cnpj_basico),
-        ],
         maximum_bytes_billed=MAX_BYTES_SOCIOS_FOCO,
     )
     df = client.query(sql, job_config=job_config).to_dataframe()
@@ -377,7 +382,7 @@ def consultar_empresas_vinculadas_por_nome(
 
     data_ref_str = data_ref.strftime("%Y-%m-%d")
 
-    sql = """
+    sql = f"""
     WITH nomes_socios AS (
         SELECT DISTINCT nome
         FROM UNNEST(@lista_nomes) AS nome
@@ -395,7 +400,7 @@ def consultar_empresas_vinculadas_por_nome(
         FROM `basedosdados.br_me_cnpj.socios` AS s
         JOIN nomes_socios n
             ON s.nome = n.nome
-        WHERE s.data = @data_ref
+        WHERE s.data = '{data_ref_str}'
     ),
     cnpjs_socios AS (
         SELECT DISTINCT cnpj_basico
@@ -417,7 +422,7 @@ def consultar_empresas_vinculadas_por_nome(
             ON e.cnpj_basico = c.cnpj_basico
         LEFT JOIN `basedosdados.br_bd_diretorios_brasil.natureza_juridica` nj
             ON e.natureza_juridica = nj.id_natureza_juridica
-        WHERE e.data = @data_ref
+        WHERE e.data = '{data_ref_str}'
     ),
     joined AS (
         SELECT
@@ -448,7 +453,6 @@ def consultar_empresas_vinculadas_por_nome(
         query_parameters=[
             bigquery.ArrayQueryParameter("lista_nomes", "STRING", nomes_socios),
             bigquery.ScalarQueryParameter("cnpj_foco", "STRING", cnpj_basico_foco),
-            bigquery.ScalarQueryParameter("data_ref", "DATE", data_ref_str),
         ],
         maximum_bytes_billed=MAX_BYTES_EMP_VINC,
     )
