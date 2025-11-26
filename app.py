@@ -152,14 +152,14 @@ def get_latest_snapshots() -> dict:
     max_data AS (
         SELECT 'empresas' AS table_name, MAX(data) AS data_ref
         FROM `basedosdados.br_me_cnpj.empresas`
-        WHERE _PARTITIONDATE IN (
+        WHERE DATE(_PARTITIONTIME) IN (
             SELECT DISTINCT part FROM latest_partitions, UNNEST(parts) AS part
             WHERE table_name = 'empresas'
         )
         UNION ALL
         SELECT 'socios' AS table_name, MAX(data) AS data_ref
         FROM `basedosdados.br_me_cnpj.socios`
-        WHERE _PARTITIONDATE IN (
+        WHERE DATE(_PARTITIONTIME) IN (
             SELECT DISTINCT part FROM latest_partitions, UNNEST(parts) AS part
             WHERE table_name = 'socios'
         )
@@ -1187,6 +1187,7 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
 
