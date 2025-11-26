@@ -70,8 +70,14 @@ st.sidebar.markdown("### ⚙️ Log de execução")
 # Agora considerando 1 snapshot (~5–6 GiB) com folga
 MAX_BYTES_EMPRESA_FOCO = 8 * 1024**3       # ~8 GiB
 MAX_BYTES_SOCIOS_FOCO  = 8 * 1024**3       # ~8 GiB
-MAX_BYTES_EMP_VINC     = 8 * 1024**3      # ~14 GiB (join mais pesado)
-MAX_BYTES_DATA_REF     = 30 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
+MAX_BYTES_EMP_VINC     = 14 * 1024**3      # ~14 GiB (join mais pesado)
+MAX_BYTES_DATA_REF     = 6 * 1024**3       # ~6 GiB (descobrir snapshot mais recente)
+
+# Janela de segurança para descobrir a data mais recente usando a coluna
+# `data`, porém limitada às partições mais novas (para reduzir bytes
+# processados). As tabelas são particionadas por ingestão; usamos a data da
+# partição mais recente como âncora e olhamos apenas para os últimos N dias.
+MAX_SNAPSHOT_LOOKBACK_DAYS = 540  # ~18 meses para cobrir trocas de periodicidade
 
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
@@ -115,27 +121,64 @@ def get_latest_snapshots() -> dict:
     - As tabelas são views autorizadas, o que impede o uso direto das pseudo
       colunas de partição (_PARTITIONTIME / _PARTITIONDATE). Tentativas de
       filtrar por partição resultavam em "Unrecognized name".
-    - Para manter a consulta estável e ainda assim limitar bytes, calculamos
-      apenas o MAX(data), evitando SELECT * e sem filtros de partição.
-      A coluna `data` é compacta (~60 milhões de linhas), então o custo
-      permanece baixo e bem abaixo do limite configurado.
+    - Para manter a consulta estável e ainda assim limitar bytes, usamos a
+      partição de ingestão mais recente do INFORMATION_SCHEMA para definir uma
+      âncora temporal e filtramos a coluna `data` para os últimos
+      MAX_SNAPSHOT_LOOKBACK_DAYS dias. Isso reduz o volume processado sem
+      arriscar perder o snapshot mais novo.
     """
     client = get_bq_client()
     sql = """
-    WITH max_data AS (
-        SELECT 'empresas' AS table_name, MAX(data) AS data_ref
-        FROM `basedosdados.br_me_cnpj.empresas`
+    DECLARE lookback_days INT64 DEFAULT @lookback_days;
+
+    WITH latest_partitions AS (
+        SELECT
+            table_name,
+            MAX(PARSE_DATE('%Y%m%d', partition_id)) AS max_partition_date
+        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name IN ('empresas', 'socios')
+        GROUP BY table_name
+    ),
+    bounds AS (
+        SELECT
+            'empresas' AS table_name,
+            COALESCE(MAX(CASE WHEN table_name = 'empresas' THEN max_partition_date END), CURRENT_DATE()) AS anchor_date
+        FROM latest_partitions
 
         UNION ALL
 
-        SELECT 'socios' AS table_name, MAX(data) AS data_ref
-        FROM `basedosdados.br_me_cnpj.socios`
+        SELECT
+            'socios' AS table_name,
+            COALESCE(MAX(CASE WHEN table_name = 'socios' THEN max_partition_date END), CURRENT_DATE()) AS anchor_date
+        FROM latest_partitions
+    ),
+    max_data AS (
+        SELECT
+            'empresas' AS table_name,
+            MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.empresas` AS e
+        JOIN bounds b ON b.table_name = 'empresas'
+        WHERE e.data >= DATE_SUB(b.anchor_date, INTERVAL lookback_days DAY)
+
+        UNION ALL
+
+        SELECT
+            'socios' AS table_name,
+            MAX(data) AS data_ref
+        FROM `basedosdados.br_me_cnpj.socios` AS s
+        JOIN bounds b ON b.table_name = 'socios'
+        WHERE s.data >= DATE_SUB(b.anchor_date, INTERVAL lookback_days DAY)
     )
     SELECT table_name, data_ref
     FROM max_data
     """
 
     job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "lookback_days", "INT64", MAX_SNAPSHOT_LOOKBACK_DAYS
+            ),
+        ],
         maximum_bytes_billed=MAX_BYTES_DATA_REF,
     )
     df = client.query(sql, job_config=job_config).to_dataframe()
@@ -1149,6 +1192,7 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
 
