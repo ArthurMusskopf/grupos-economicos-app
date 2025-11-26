@@ -75,6 +75,7 @@ MAX_BYTES_DATA_REF     = 6 * 1024**3       # ~6 GiB (descobrir snapshot mais rec
 
 # Quantidade de partições de ingestão a inspecionar ao buscar o snapshot mais recente
 PARTICOES_RECENTES = 4
+
 # Cache de 24h, até 200 CNPJs diferentes
 CACHE_TTL = 60 * 60 * 24
 
@@ -123,24 +124,30 @@ def get_latest_snapshots() -> dict:
     """
     client = get_bq_client()
     sql = f"""
-    DECLARE n_partitions INT64 DEFAULT @particoes_recentes;
-
-    WITH latest_partitions AS (
-        SELECT 'empresas' AS table_name,
-               ARRAY_AGG(DATE(PARSE_DATE('%Y%m%d', partition_id))
-                        ORDER BY partition_id DESC LIMIT n_partitions) AS parts
+    WITH last_parts_empresas AS (
+        SELECT DATE(PARSE_DATE('%Y%m%d', partition_id)) AS part
         FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
         WHERE table_name = 'empresas'
           AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+        QUALIFY ROW_NUMBER() OVER (ORDER BY partition_id DESC) <= @particoes_recentes
+    ),
+    last_parts_socios AS (
+        SELECT DATE(PARSE_DATE('%Y%m%d', partition_id)) AS part
+        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'socios'
+          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+        QUALIFY ROW_NUMBER() OVER (ORDER BY partition_id DESC) <= @particoes_recentes
+    ),
+    latest_partitions AS (
+        SELECT 'empresas' AS table_name,
+               ARRAY_AGG(part ORDER BY part DESC) AS parts
+        FROM last_parts_empresas
 
         UNION ALL
 
         SELECT 'socios' AS table_name,
-               ARRAY_AGG(DATE(PARSE_DATE('%Y%m%d', partition_id))
-                        ORDER BY partition_id DESC LIMIT n_partitions) AS parts
-        FROM `basedosdados.br_me_cnpj.INFORMATION_SCHEMA.PARTITIONS`
-        WHERE table_name = 'socios'
-          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+               ARRAY_AGG(part ORDER BY part DESC) AS parts
+        FROM last_parts_socios
     ),
     max_data AS (
         SELECT 'empresas' AS table_name, MAX(data) AS data_ref
@@ -177,7 +184,7 @@ def get_latest_snapshots() -> dict:
             result[row["table_name"]] = row["data_ref"].isoformat()
 
     return result
-
+    
 # ============================================================
 # HELPERS DE CNPJ
 # ============================================================
@@ -1180,6 +1187,7 @@ if grafo_data is not None:
 
                         st.markdown("**QSA (amostra a partir dos sócios do grupo)**")
                         st.dataframe(df_qsa_emp)
+
 
 
 
